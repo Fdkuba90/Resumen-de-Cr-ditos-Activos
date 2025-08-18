@@ -16,44 +16,198 @@ function normalizeSpaces(s = "") {
     .trim();
 }
 
-function pagesToText(pdfData) {
-  const lines = [];
-  for (const page of pdfData.Pages || []) {
-    const rows = new Map();
-    for (const t of page.Texts || []) {
-      const y = Math.round(t.y * 4) / 4; // agrupar por cuartos
-      const arr = rows.get(y) || [];
-      const fragment = (t.R || []).map((r) => decodeTxt(r.T)).join("");
-      arr.push({ x: t.x, text: fragment });
-      rows.set(y, arr);
+// Agrupa en "renglones" por coordenada Y con tolerancia (sin perder X/Y originales)
+function pageToRows(page, yTol = 0.35) {
+  const rows = []; // [{y, cells:[{x,text}]}]
+  for (const t of page.Texts || []) {
+    const text = (t.R || []).map(r => decodeTxt(r.T)).join("");
+    if (!text.trim()) continue;
+    const y = t.y;
+    let row = null;
+    for (const r of rows) {
+      if (Math.abs(r.y - y) <= yTol) { row = r; break; }
     }
-    const sortedY = [...rows.keys()].sort((a, b) => a - b);
-    for (const y of sortedY) {
-      const cols = rows.get(y).sort((a, b) => a.x - b.x);
-      const line = cols.map((c) => c.text).join(" ").replace(/[ \t]+/g, " ").trim();
-      if (line) lines.push(line);
-    }
-    lines.push("<<<PAGE_BREAK>>>");
+    if (!row) { row = { y, cells: [] }; rows.push(row); }
+    row.cells.push({ x: t.x, text });
   }
-  return lines.join("\n");
+  // ordena filas por y y cada fila por x
+  rows.sort((a,b) => a.y - b.y);
+  for (const r of rows) r.cells.sort((a,b) => a.x - b.x);
+  return rows;
 }
 
 function parseNumberMX(str) {
-  if (!str) return null;
+  if (str == null) return null;
   let s = String(str).replace(/\u00A0/g, " ").trim();
   s = s.replace(/\s/g, "").replace(/\$/g, "");
-  const isNeg = /^\(.*\)$/.test(s);
+  const neg = /^\(.*\)$/.test(s);
   s = s.replace(/[(),]/g, "");
   if (!s || isNaN(Number(s))) return null;
   const n = Number(s);
-  return isNeg ? -n : n;
+  return neg ? -n : n;
 }
 
 function detectMilesDePesos(text) {
   return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text);
 }
 
-/* ========== FALLBACK por etiquetas (si no se encuentra Totales) ========== */
+function textOfRow(row) {
+  return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim();
+}
+
+// Busca página y bloque donde aparece la tabla “Créditos Activos / Capital + Intereses”
+function findActivosPage(pdfData) {
+  const pages = pdfData.Pages || [];
+  for (let p = 0; p < pages.length; p++) {
+    const rows = pageToRows(pages[p], 0.35);
+    const joined = rows.map(textOfRow).join("\n");
+    if (/Cr[ée]ditos Activos/i.test(joined) && /Capital\s*\+\s*Intereses/i.test(joined)) {
+      return { pageIndex: p, rows };
+    }
+  }
+  return null;
+}
+
+function buildResult({ original, vigente, buckets, multiplier, fuente }) {
+  const vencido =
+    (buckets.v1_29 || 0) +
+    (buckets.v30_59 || 0) +
+    (buckets.v60_89 || 0) +
+    (buckets.v90_119 || 0) +
+    (buckets.v120_179 || 0) +
+    (buckets.v180p || 0);
+
+  return {
+    montoOriginal: original != null ? original * multiplier : null,
+    saldoVigente: vigente != null ? vigente * multiplier : null,
+    buckets: {
+      "1_29":    (buckets.v1_29   || 0) * multiplier,
+      "30_59":   (buckets.v30_59  || 0) * multiplier,
+      "60_89":   (buckets.v60_89  || 0) * multiplier,
+      "90_119":  (buckets.v90_119 || 0) * multiplier,
+      "120_179": (buckets.v120_179|| 0) * multiplier,
+      "180_mas": (buckets.v180p   || 0) * multiplier,
+    },
+    saldoVencido: vencido * multiplier,
+    saldoTotal: (vigente != null ? vigente * multiplier : 0) + vencido * multiplier,
+    unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
+    fuente,
+  };
+}
+
+/* ======================== EXTRACCIÓN POR COORDENADAS ======================== */
+// Etiquetas esperadas del header y sus regex (columna -> regex)
+const HEADER_COLS = [
+  { key: "original",   re: /\boriginal\b/i },
+  { key: "vigente",    re: /\bvigente\b/i },
+  { key: "v1_29",      re: /(1\s*[–-]\s*29|1\s*a\s*29)\s*d[ií]as?/i },
+  { key: "v30_59",     re: /(30\s*[–-]\s*59|30\s*a\s*59)\s*d[ií]as?/i },
+  { key: "v60_89",     re: /(60\s*[–-]\s*89|60\s*a\s*89)\s*d[ií]as?/i },
+  { key: "v90_119",    re: /(90\s*[–-]\s*119|90\s*a\s*119)\s*d[ií]as?/i },
+  { key: "v120_179",   re: /(120\s*[–-]\s*179|120\s*a\s*179)\s*d[ií]as?/i },
+  { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
+];
+
+// Encuentra la fila de encabezado (donde estén “Original”, “Vigente”, “1–29 días”, …)
+function findHeaderConfig(rows) {
+  for (const row of rows) {
+    const line = textOfRow(row);
+    const hasOriginal = /original/i.test(line);
+    const hasVigente  = /vigente/i.test(line);
+    const hasDias     = /d[ií]as/i.test(line);
+    if (hasOriginal && hasVigente && hasDias) {
+      // Mapea cada columna a su posición X aproximada
+      const colCenters = {};
+      for (const col of HEADER_COLS) {
+        // Busca el token del header que matchee ese col en la fila
+        let best = null;
+        for (const c of row.cells) {
+          if (col.re.test(c.text)) { best = c; break; }
+        }
+        if (best) colCenters[col.key] = best.x;
+      }
+      // Debemos tener al menos Original + Vigente para seguir
+      if (colCenters.original != null && colCenters.vigente != null) {
+        return { headerRowY: row.y, colCenters };
+      }
+    }
+  }
+  return null;
+}
+
+// Dada una fila (cells con x/text), asigna valores numéricos a cada columna del header por cercanía en X
+function assignRowToColumns(row, colCenters) {
+  const result = { original:null, vigente:null, v1_29:0, v30_59:0, v60_89:0, v90_119:0, v120_179:0, v180p:0, hasTotales:false };
+
+  // ¿trae "Totales"?
+  if (row.cells.some(c => /Totales\s*:?/i.test(c.text))) {
+    result.hasTotales = true;
+  }
+
+  // Por cada celda numérica, la enviamos a la columna con X más cercana (si existe)
+  for (const c of row.cells) {
+    const n = parseNumberMX(c.text);
+    if (n === null) continue;
+
+    // Encuentra columna más cercana
+    let bestKey = null, bestDist = Infinity;
+    for (const [key, x] of Object.entries(colCenters)) {
+      const d = Math.abs(c.x - x);
+      if (d < bestDist) { bestDist = d; bestKey = key; }
+    }
+    if (!bestKey) continue;
+
+    if (bestKey === "original" || bestKey === "vigente") {
+      // en estas columnas esperamos un único valor; si aparece más de uno, nos quedamos con el último
+      result[bestKey] = n;
+    } else {
+      // buckets se acumulan por si el PDF divide la cifra en varios tokens
+      result[bestKey] = (result[bestKey] || 0) + n;
+    }
+  }
+  return result;
+}
+
+// Orquesta: localizar encabezado, luego recorrer filas hasta hallar "Totales"
+function extractTotalsByCoords(pdfData) {
+  const hit = findActivosPage(pdfData);
+  if (!hit) return null;
+
+  const { pageIndex } = hit;
+  const rows = pageToRows(pdfData.Pages[pageIndex], 0.35);
+
+  const header = findHeaderConfig(rows);
+  if (!header) return null;
+
+  // Tomamos las filas DESPUÉS del encabezado, hasta que empiece otra sección o se acabe página
+  const startIdx = rows.findIndex(r => r.y === rows.find(rr => rr.y === header.headerRowY).y);
+  const candidates = rows.slice(startIdx + 1);
+
+  for (const row of candidates) {
+    const line = textOfRow(row);
+    // Heurística de corte: si empieza otra sección grande (Resumen Créditos Activos, Créditos Liquidados, etc.)
+    if (/Resumen Cr[ée]ditos Activos|Cr[ée]ditos Liquidados|INFORMACI[ÓO]N COMERCIAL/i.test(line)) break;
+
+    const mapped = assignRowToColumns(row, header.colCenters);
+    if (mapped.hasTotales) {
+      return {
+        original: mapped.original,
+        vigente:  mapped.vigente,
+        buckets: {
+          v1_29: mapped.v1_29 || 0,
+          v30_59: mapped.v30_59 || 0,
+          v60_89: mapped.v60_89 || 0,
+          v90_119: mapped.v90_119 || 0,
+          v120_179: mapped.v120_179 || 0,
+          v180p: mapped.v180p || 0,
+        }
+      };
+    }
+  }
+  return null;
+}
+
+/* ======================== FALLBACKS (texto) ======================== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -112,94 +266,6 @@ function extractBuckets(lines) {
   return out;
 }
 
-/* ========== NUEVO: Totales de “Créditos Activos / Capital + Intereses” ========== */
-/*  Patch: tomar SOLO la línea de "Totales:" o, si hace falta, la línea previa.
-    Evita mezclar con filas como "89 87 ..." que pueden estar arriba. */
-function extractActivosTotals(lines) {
-  let sectionStart = -1;
-
-  // util local: toma números de una línea y regresa los últimos 8 como [orig, vig, b1..b6]
-  function takeFromLine(line) {
-    const nums = (line.match(/[-$()0-9.,]+/g) || [])
-      .map(parseNumberMX)
-      .filter((v) => v !== null);
-    if (nums.length < 2) return null;
-    const take = nums.slice(-8);
-    while (take.length < 8) take.push(0);
-    const [original, vigente, b1, b2, b3, b4, b5, b6] = take;
-    return {
-      original,
-      vigente,
-      buckets: {
-        v1_29: b1 || 0,
-        v30_59: b2 || 0,
-        v60_89: b3 || 0,
-        v90_119: b4 || 0,
-        v120_179: b5 || 0,
-        v180p:  b6 || 0,
-      },
-    };
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const ln = lines[i];
-
-    // Marca el inicio de la sección correcta
-    if (/(Cr[ée]ditos Activos|Capital \+\s*Intereses)/i.test(ln)) {
-      sectionStart = i;
-    }
-
-    // Solo buscamos "Totales:" dentro de esa sección (ventana razonable)
-    if (/Totales\s*:?/i.test(ln) && sectionStart !== -1 && i - sectionStart < 180) {
-      // A) MismA línea: números antes de "Totales:"
-      const beforeSameLine = ln.split(/Totales\s*:/i)[0] || "";
-      let res = takeFromLine(beforeSameLine);
-      if (res) return res;
-
-      // B) Solo la línea previa (algunas plantillas separan la etiqueta)
-      const prev = lines[i - 1] || "";
-      res = takeFromLine(prev);
-      if (res) return res;
-
-      // C) Combinado conservador: previa + misma (en ese orden)
-      const combined = (prev + " " + beforeSameLine).trim();
-      res = takeFromLine(combined);
-      if (res) return res;
-
-      // Si no, seguimos buscando por si hay otra coincidencia
-    }
-  }
-  return null;
-}
-
-function buildResult({ original, vigente, buckets, multiplier, fuente }) {
-  const vencido =
-    (buckets.v1_29 || 0) +
-    (buckets.v30_59 || 0) +
-    (buckets.v60_89 || 0) +
-    (buckets.v90_119 || 0) +
-    (buckets.v120_179 || 0) +
-    (buckets.v180p || 0);
-
-  return {
-    montoOriginal: original != null ? original * multiplier : null,
-    saldoVigente: vigente != null ? vigente * multiplier : null,
-    buckets: {
-      "1_29":   (buckets.v1_29   || 0) * multiplier,
-      "30_59":  (buckets.v30_59  || 0) * multiplier,
-      "60_89":  (buckets.v60_89  || 0) * multiplier,
-      "90_119": (buckets.v90_119 || 0) * multiplier,
-      "120_179":(buckets.v120_179|| 0) * multiplier,
-      "180_mas":(buckets.v180p   || 0) * multiplier,
-    },
-    saldoVencido: vencido * multiplier,
-    saldoTotal:
-      (vigente != null ? vigente * multiplier : 0) + vencido * multiplier,
-    unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
-    fuente,
-  };
-}
-
 /* ======================== HANDLER ======================== */
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -230,35 +296,32 @@ export default async function handler(req, res) {
 
     pdfParser.on("pdfParser_dataReady", (pdfData) => {
       try {
-        const fullText = pagesToText(pdfData);
-        const normalized = normalizeSpaces(fullText);
-        const lines = normalized.split(/\n+/).map((x) => x.trim()).filter(Boolean);
-        const multiplier = detectMilesDePesos(normalized) ? 1000 : 1;
+        // Texto normalizado solo para detectar "miles de pesos" y fallback de etiquetas
+        const allLinesText = normalizeSpaces(
+          (pdfData.Pages || []).map(p => pageToRows(p).map(textOfRow).join("\n")).join("\n")
+        );
+        const multiplier = detectMilesDePesos(allLinesText) ? 1000 : 1;
 
-        // 1) Totales (preferido)
-        const totals = extractActivosTotals(lines);
-
+        // ===== 1) Método principal: COORDENADAS (fila Totales) =====
+        const totals = extractTotalsByCoords(pdfData);
         if (totals) {
           const payload = buildResult({
             original: totals.original,
             vigente: totals.vigente,
             buckets: totals.buckets,
             multiplier,
-            fuente: "Totales de Créditos Activos",
+            fuente: "Totales de Créditos Activos (por coordenadas)"
           });
-          return res.status(200).json({
-            ok: true,
-            meta: { milesDePesosDetectado: multiplier === 1000 },
-            data: payload,
-          });
+          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
         }
 
-        // 2) Si el usuario exige solo Totales, error si no existe
+        // ===== 2) Si exige solo Totales, error si no se localizó por coordenadas =====
         if (onlyTotals) {
           return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
         }
 
-        // 3) Fallback por etiquetas
+        // ===== 3) Fallback por texto/etiquetas =====
+        const lines = allLinesText.split(/\n+/).map(s => s.trim()).filter(Boolean);
         const original = extractSingleLabeled(lines, /\boriginal\b/i);
         const vigente = extractSingleLabeled(lines, /\bvigente\b/i);
         const buckets = extractBuckets(lines);
@@ -268,7 +331,7 @@ export default async function handler(req, res) {
           vigente,
           buckets,
           multiplier,
-          fuente: "Fallback por etiquetas",
+          fuente: "Fallback por etiquetas (texto)"
         });
 
         return res.status(200).json({
