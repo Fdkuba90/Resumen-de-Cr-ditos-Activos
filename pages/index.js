@@ -3,6 +3,7 @@ import { useState } from "react";
 
 export default function Home() {
   const [file, setFile] = useState(null);
+  const [onlyTotals, setOnlyTotals] = useState(true);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
@@ -17,6 +18,7 @@ export default function Home() {
     }
     const fd = new FormData();
     fd.append("file", file);
+    fd.append("onlyTotals", String(onlyTotals));
     setLoading(true);
     try {
       const resp = await fetch("/api/extractResumen", {
@@ -39,10 +41,11 @@ export default function Home() {
   }
 
   return (
-    <div style={{ maxWidth: 720, margin: "40px auto", fontFamily: "Inter, system-ui, sans-serif" }}>
-      <h1 style={{ fontSize: 28, marginBottom: 8 }}>Extractor Resumen Buró (PDF)</h1>
-      <p style={{ color: "#555", marginBottom: 24 }}>
-        Sube el reporte PDF del Buró de Crédito empresarial. Se extraerán: Original, Vigente, buckets de vencido y totales.
+    <div style={{ maxWidth: 780, margin: "40px auto", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <h1 style={{ fontSize: 28, marginBottom: 8 }}>Extractor – Resumen de Créditos Activos</h1>
+      <p style={{ color: "#555", marginBottom: 16 }}>
+        Sube el Buró en PDF. Se tomará la fila <strong>“Totales”</strong> de <em>Créditos Activos / Capital + Intereses</em>. 
+        Se convierte a pesos si el reporte viene en miles.
       </p>
 
       <form onSubmit={onSubmit} style={{ display: "grid", gap: 12 }}>
@@ -51,6 +54,14 @@ export default function Home() {
           accept="application/pdf"
           onChange={(e) => setFile(e.target.files?.[0] || null)}
         />
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={onlyTotals}
+            onChange={(e) => setOnlyTotals(e.target.checked)}
+          />
+          Usar solo “Totales” (si no existe, marcar error)
+        </label>
         <button
           type="submit"
           disabled={loading}
@@ -68,11 +79,7 @@ export default function Home() {
         </button>
       </form>
 
-      {err && (
-        <div style={{ marginTop: 16, color: "#b00020" }}>
-          {err}
-        </div>
-      )}
+      {err && <div style={{ marginTop: 16, color: "#b00020" }}>{err}</div>}
 
       {result?.ok && (
         <div style={{ marginTop: 24, padding: 16, border: "1px solid #eee", borderRadius: 12 }}>
@@ -101,13 +108,9 @@ export default function Home() {
             <li>180+ días: {formatMoney(result.data.buckets["180_mas"])}</li>
           </ul>
 
-          <details style={{ marginTop: 12 }}>
-            <summary>Debug</summary>
-            <pre style={{ whiteSpace: "pre-wrap" }}>
-{JSON.stringify(result.debug, null, 2)}
-            </pre>
-            <div>“Miles de pesos” detectado: {String(result.meta?.milesDePesosDetectado)}</div>
-          </details>
+          <div style={{ marginTop: 12, fontSize: 13, color: "#666" }}>
+            Fuente: <strong>{result.data.fuente}</strong> · “Miles de pesos” detectado: {String(result.meta?.milesDePesosDetectado)}
+          </div>
         </div>
       )}
     </div>
