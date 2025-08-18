@@ -63,14 +63,13 @@ const HEADER_COLS = [
   { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
 ];
 
-// Busca el header combinando hasta 3 renglones (multi-línea)
+// Header multi-línea (combina hasta 3 renglones) + centros de columna + tolerancia dinámica
 function findHeaderConfig(rows) {
   for (let i = 0; i < rows.length; i++) {
     const r0 = rows[i];
     const l0 = textOfRow(r0);
     if (!/original/i.test(l0) || !/vigente/i.test(l0)) continue;
 
-    // Unimos hasta 3 filas contiguas para capturar etiquetas que bajaron de renglón (p.ej. “30–59” y “días”)
     const merged = { y: r0.y, cells: [...r0.cells] };
     if (rows[i+1] && rows[i+1].y - r0.y < 1.8) merged.cells.push(...rows[i+1].cells);
     if (rows[i+2] && rows[i+2].y - r0.y < 2.6) merged.cells.push(...rows[i+2].cells);
@@ -88,22 +87,18 @@ function findHeaderConfig(rows) {
       }
       if (best) colCenters[col.key] = best.x;
     }
-
-    // Aseguramos al menos Original/Vigente y algún bucket
     if (colCenters.original == null || colCenters.vigente == null) continue;
 
-    // Si faltan buckets, infiere centros a partir del patrón de espaciado
+    // Completa centros faltantes estimando espaciado
     const known = Object.entries(colCenters).sort((a,b)=>a[1]-b[1]);
     const xs = known.map(([,x])=>x);
-    const gaps = [];
-    for (let k=1;k<xs.length;k++) gaps.push(xs[k]-xs[k-1]);
+    const gaps = []; for (let k=1;k<xs.length;k++) gaps.push(xs[k]-xs[k-1]);
     const median = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 4.5;
 
     const want = ["v1_29","v30_59","v60_89","v90_119","v120_179","v180p"];
     for (const key of want) {
       if (colCenters[key] == null) {
-        // estima: coloca después del último conocido hacia la derecha con gap ~median
-        colCenters[key] = xs.length ? (xs[0] + median * (want.indexOf(key)+2)) : (colCenters.vigente + median*(want.indexOf(key)+1));
+        colCenters[key] = (colCenters.vigente ?? xs[0]) + median * (want.indexOf(key)+1);
       }
     }
 
@@ -112,14 +107,14 @@ function findHeaderConfig(rows) {
       const g=[]; for(let k=1;k<xsAll.length;k++) g.push(xsAll[k]-xsAll[k-1]);
       return g.sort((a,b)=>a-b)[Math.floor(g.length/2)] || 5;
     })();
-    const maxDist = Math.max(2.0, medGap * 0.6); // tolera header ancho/multilínea
+    const maxDist = Math.max(2.0, medGap * 0.6);
 
     return { headerRowY: r0.y, colCenters, maxDist };
   }
   return null;
 }
 
-// Asigna tokens numéricos a columnas por cercanía en X; con fallback por orden
+// Asigna por cercanía en X; además guarda todos los números ordenados por X para fallback por orden
 function assignRowToColumns(row, colCenters, maxDist) {
   const acc = {
     original: [], vigente: [],
@@ -138,8 +133,7 @@ function assignRowToColumns(row, colCenters, maxDist) {
       const d = Math.abs(c.x - x);
       if (d < bestDist) { bestDist = d; bestKey = key; }
     }
-    if (!bestKey || bestDist > maxDist) continue; // demasiado lejos
-
+    if (!bestKey || bestDist > maxDist) continue; // demasiado lejos para asignar
     acc[bestKey].push(n);
   }
 
@@ -157,25 +151,21 @@ function assignRowToColumns(row, colCenters, maxDist) {
     v180p:   sum(acc.v180p),
   };
 
-  // Fallback por orden de aparición en “Totales”: O, V, 1–29, 30–59, …
-  if ((original == null || original === 0) || (vigente == null || vigente === 0) ||
-      (buckets.v1_29 === 0 && buckets.v30_59 === 0 && buckets.v60_89 === 0 && buckets.v90_119 === 0 &&
-       buckets.v120_179 === 0 && buckets.v180p === 0)) {
-    const ordered = acc.numericByX.sort((a,b)=>a.x-b.x).map(o=>o.n);
-    if (ordered[0] != null && (original == null || original === 0)) original = ordered[0];
-    if (ordered[1] != null && (vigente  == null || vigente  === 0)) vigente  = ordered[1];
-    if (ordered[2] != null && buckets.v1_29   === 0) buckets.v1_29   = ordered[2];
-    if (ordered[3] != null && buckets.v30_59  === 0) buckets.v30_59  = ordered[3];
-    if (ordered[4] != null && buckets.v60_89  === 0) buckets.v60_89  = ordered[4];
-    if (ordered[5] != null && buckets.v90_119 === 0) buckets.v90_119 = ordered[5];
-    // Ojo: en algunos reportes el orden de 120–179 y 180+ viene invertido; si sólo uno aparece, lo respetamos
-    if (ordered[6] != null && buckets.v120_179 === 0 && buckets.v180p === 0) {
-      // heurística: si la palabra "180" está antes que "120-179" en el header, el 6º número es 180+
-      const headerOrderHint = Object.entries(colCenters).sort((a,b)=>a[1]-b[1]).map(([k])=>k).join(",");
-      if (headerOrderHint.indexOf("v180p") < headerOrderHint.indexOf("v120_179")) buckets.v180p = ordered[6];
-      else buckets.v120_179 = ordered[6];
-    }
+  // -------- Fallback por ORDEN FIJO (8 columnas) --------
+  // Si falta cualquiera de los buckets o (original/vigente) pero hay suficientes números en la fila, rellenamos por orden.
+  const ordered = acc.numericByX.sort((a,b)=>a.x-b.x).map(o=>o.n); // izquierda -> derecha
+  if (ordered.length >= 2) {
+    if (original == null || original === 0) original = ordered[0];
+    if (vigente  == null || vigente  === 0) vigente  = ordered[1];
   }
+  const fillIfZero = (cur, idx) => (cur && cur !== 0) ? cur : (ordered.length > idx ? ordered[idx] : cur);
+  // índices en ordered: 0:O, 1:V, 2:1-29, 3:30-59, 4:60-89, 5:90-119, 6:120-179, 7:180+
+  buckets.v1_29   = fillIfZero(buckets.v1_29,   2);
+  buckets.v30_59  = fillIfZero(buckets.v30_59,  3);
+  buckets.v60_89  = fillIfZero(buckets.v60_89,  4);
+  buckets.v90_119 = fillIfZero(buckets.v90_119, 5);
+  buckets.v120_179= fillIfZero(buckets.v120_179,6);
+  buckets.v180p   = fillIfZero(buckets.v180p,   7);
 
   return { original, vigente, buckets, hasTotales: acc.hasTotales };
 }
