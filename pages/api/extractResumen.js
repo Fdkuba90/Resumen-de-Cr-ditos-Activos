@@ -5,10 +5,9 @@ import PDFParser from "pdf2json";
 
 export const config = { api: { bodyParser: false } };
 
-// -------- utilidades base ----------
-function decodeTxt(t = "") {
-  try { return decodeURIComponent(t); } catch { return t; }
-}
+/* ======================== UTILIDADES ======================== */
+function decodeTxt(t = "") { try { return decodeURIComponent(t); } catch { return t; } }
+
 function normalizeSpaces(s = "") {
   return (s || "")
     .replace(/\u00A0/g, " ")
@@ -16,12 +15,13 @@ function normalizeSpaces(s = "") {
     .replace(/\r/g, "")
     .trim();
 }
+
 function pagesToText(pdfData) {
   const lines = [];
   for (const page of pdfData.Pages || []) {
     const rows = new Map();
     for (const t of page.Texts || []) {
-      const y = Math.round(t.y * 4) / 4;
+      const y = Math.round(t.y * 4) / 4; // agrupar por cuartos
       const arr = rows.get(y) || [];
       const fragment = (t.R || []).map((r) => decodeTxt(r.T)).join("");
       arr.push({ x: t.x, text: fragment });
@@ -37,6 +37,7 @@ function pagesToText(pdfData) {
   }
   return lines.join("\n");
 }
+
 function parseNumberMX(str) {
   if (!str) return null;
   let s = String(str).replace(/\u00A0/g, " ").trim();
@@ -47,11 +48,12 @@ function parseNumberMX(str) {
   const n = Number(s);
   return isNeg ? -n : n;
 }
-function detectMilesDePesos(fullText) {
-  return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(fullText);
+
+function detectMilesDePesos(text) {
+  return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text);
 }
 
-// -------- extracción por etiquetas (fallback) ----------
+/* ========== FALLBACK por etiquetas (si no se encuentra Totales) ========== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -73,6 +75,7 @@ function extractSingleLabeled(lines, labelRegex) {
   }
   return null;
 }
+
 function extractBuckets(lines) {
   const bucketDefs = [
     { key: "v1_29", re: /(1\s*[–-]\s*29|1\s*a\s*29)\s*d[ií]as?/i },
@@ -109,18 +112,15 @@ function extractBuckets(lines) {
   return out;
 }
 
-// -------- NUEVO: Totales de “Créditos Activos / Capital + Intereses” ----------
+/* ========== NUEVO: Totales de “Créditos Activos / Capital + Intereses” ========== */
 function extractActivosTotals(lines) {
-  // Buscamos primero que haya contexto de la sección correcta
   let lastSectionIdx = -1;
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
     if (/(Cr[ée]ditos Activos|Capital \+\s*Intereses)/i.test(ln)) {
       lastSectionIdx = i;
     }
-    // cuando veamos "Totales:" cerca, extraemos los 8 últimos números antes de ese texto
-    if (/Totales\s*:?/i.test(ln) && lastSectionIdx !== -1 && i - lastSectionIdx < 150) {
-      // mirar la línea y vecinas – en algunos PDFs los números y “Totales:” están pegados
+    if (/Totales\s*:?/i.test(ln) && lastSectionIdx !== -1 && i - lastSectionIdx < 180) {
       const window = [
         lines[i - 2] || "",
         lines[i - 1] || "",
@@ -132,10 +132,8 @@ function extractActivosTotals(lines) {
         .map(parseNumberMX)
         .filter((v) => v !== null);
 
-      // esperamos 8 columnas: Original, Vigente, 1–29, 30–59, 60–89, 90–119, 120–179, 180+
       if (nums.length >= 2) {
-        const take = nums.slice(-8); // si vienen más campos, nos quedamos con los 8 finales
-        // completar con ceros si por layout faltan buckets
+        const take = nums.slice(-8);
         while (take.length < 8) take.unshift(0);
         const [original, vigente, b1, b2, b3, b4, b5, b6] = take;
         return {
@@ -156,8 +154,7 @@ function extractActivosTotals(lines) {
   return null;
 }
 
-// -------- armado de resultado ----------
-function buildResult({ original, vigente, buckets, multiplier }) {
+function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
     (buckets.v30_59 || 0) +
@@ -181,29 +178,33 @@ function buildResult({ original, vigente, buckets, multiplier }) {
     saldoTotal:
       (vigente != null ? vigente * multiplier : 0) + vencido * multiplier,
     unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
-    fuente: "Totales de Créditos Activos", // para que sepas de dónde salió
+    fuente,
   };
 }
 
-// -------- handler ----------
+/* ======================== HANDLER ======================== */
 export default async function handler(req, res) {
-  if (req.method !== "POST")
+  if (req.method !== "POST") {
     return res.status(405).json({ error: "Método no permitido" });
+  }
 
   const form = new IncomingForm({ multiples: false, keepExtensions: true });
 
   form.parse(req, async (err, fields, files) => {
     if (err) return res.status(400).json({ error: "No se pudo leer el formulario", detalle: String(err) });
 
+    const onlyTotals = String(fields.onlyTotals || "").toLowerCase() === "true";
     const file = files.file || files.pdf || files.upload || null;
     if (!file) return res.status(400).json({ error: "Falta el archivo PDF (campo 'file')" });
 
     const pdfPath = Array.isArray(file) ? file[0].filepath : file.filepath;
-    let pdfBuffer = null;
+
+    let pdfBuffer;
     try { pdfBuffer = fs.readFileSync(pdfPath); }
-    catch (e) { return res.status(400).json({ error: "No se pudo leer el archivo subido" }); }
+    catch { return res.status(400).json({ error: "No se pudo leer el archivo subido" }); }
 
     const pdfParser = new PDFParser(this, 1);
+
     pdfParser.on("pdfParser_dataError", (e) => {
       console.error("pdf2json error:", e?.parserError || e);
       return res.status(500).json({ error: "Error al procesar el PDF" });
@@ -216,28 +217,37 @@ export default async function handler(req, res) {
         const lines = normalized.split(/\n+/).map((x) => x.trim()).filter(Boolean);
         const multiplier = detectMilesDePesos(normalized) ? 1000 : 1;
 
-        // 1) Intento principal: Totales de Créditos Activos
+        // 1) Totales (preferido)
         const totals = extractActivosTotals(lines);
-        let payload;
 
         if (totals) {
-          payload = buildResult({
+          const payload = buildResult({
             original: totals.original,
             vigente: totals.vigente,
             buckets: totals.buckets,
             multiplier,
+            fuente: "Totales de Créditos Activos",
           });
-        } else {
-          // 2) Fallback al método por etiquetas
-          const reOriginal = /\boriginal\b/i;
-          const reVigente = /\bvigente\b/i;
-          const original = extractSingleLabeled(lines, reOriginal);
-          const vigente = extractSingleLabeled(lines, reVigente);
-          const buckets = extractBuckets(lines);
-
-          payload = buildResult({ original, vigente, buckets, multiplier });
-          payload.fuente = "Fallback por etiquetas";
+          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
         }
+
+        // Si el usuario exige solo Totales, error si no existe
+        if (onlyTotals) {
+          return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
+        }
+
+        // 2) Fallback por etiquetas
+        const original = extractSingleLabeled(lines, /\boriginal\b/i);
+        const vigente = extractSingleLabeled(lines, /\bvigente\b/i);
+        const buckets = extractBuckets(lines);
+
+        const payload = buildResult({
+          original,
+          vigente,
+          buckets,
+          multiplier,
+          fuente: "Fallback por etiquetas",
+        });
 
         return res.status(200).json({
           ok: true,
