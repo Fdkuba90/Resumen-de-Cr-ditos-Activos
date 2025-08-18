@@ -30,7 +30,6 @@ function pageToRows(page, yTol = 0.35) {
     if (!row) { row = { y, cells: [] }; rows.push(row); }
     row.cells.push({ x: t.x, text });
   }
-  // ordena filas por y y cada fila por x
   rows.sort((a,b) => a.y - b.y);
   for (const r of rows) r.cells.sort((a,b) => a.x - b.x);
   return rows;
@@ -55,7 +54,7 @@ function textOfRow(row) {
   return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim();
 }
 
-// Busca página y bloque donde aparece la tabla “Créditos Activos / Capital + Intereses”
+/* ======================== UBICACIÓN DE LA TABLA ======================== */
 function findActivosPage(pdfData) {
   const pages = pdfData.Pages || [];
   for (let p = 0; p < pages.length; p++) {
@@ -68,35 +67,7 @@ function findActivosPage(pdfData) {
   return null;
 }
 
-function buildResult({ original, vigente, buckets, multiplier, fuente }) {
-  const vencido =
-    (buckets.v1_29 || 0) +
-    (buckets.v30_59 || 0) +
-    (buckets.v60_89 || 0) +
-    (buckets.v90_119 || 0) +
-    (buckets.v120_179 || 0) +
-    (buckets.v180p || 0);
-
-  return {
-    montoOriginal: original != null ? original * multiplier : null,
-    saldoVigente: vigente != null ? vigente * multiplier : null,
-    buckets: {
-      "1_29":    (buckets.v1_29   || 0) * multiplier,
-      "30_59":   (buckets.v30_59  || 0) * multiplier,
-      "60_89":   (buckets.v60_89  || 0) * multiplier,
-      "90_119":  (buckets.v90_119 || 0) * multiplier,
-      "120_179": (buckets.v120_179|| 0) * multiplier,
-      "180_mas": (buckets.v180p   || 0) * multiplier,
-    },
-    saldoVencido: vencido * multiplier,
-    saldoTotal: (vigente != null ? vigente * multiplier : 0) + vencido * multiplier,
-    unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
-    fuente,
-  };
-}
-
 /* ======================== EXTRACCIÓN POR COORDENADAS ======================== */
-// Etiquetas esperadas del header y sus regex (columna -> regex)
 const HEADER_COLS = [
   { key: "original",   re: /\boriginal\b/i },
   { key: "vigente",    re: /\bvigente\b/i },
@@ -108,7 +79,6 @@ const HEADER_COLS = [
   { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
 ];
 
-// Encuentra la fila de encabezado (donde estén “Original”, “Vigente”, “1–29 días”, …)
 function findHeaderConfig(rows) {
   for (const row of rows) {
     const line = textOfRow(row);
@@ -116,59 +86,82 @@ function findHeaderConfig(rows) {
     const hasVigente  = /vigente/i.test(line);
     const hasDias     = /d[ií]as/i.test(line);
     if (hasOriginal && hasVigente && hasDias) {
-      // Mapea cada columna a su posición X aproximada
       const colCenters = {};
       for (const col of HEADER_COLS) {
-        // Busca el token del header que matchee ese col en la fila
         let best = null;
         for (const c of row.cells) {
           if (col.re.test(c.text)) { best = c; break; }
         }
         if (best) colCenters[col.key] = best.x;
       }
-      // Debemos tener al menos Original + Vigente para seguir
       if (colCenters.original != null && colCenters.vigente != null) {
-        return { headerRowY: row.y, colCenters };
+        // calcula un umbral dinámico: mitad del gap típico entre columnas
+        const xs = Object.values(colCenters).sort((a,b)=>a-b);
+        const gaps = [];
+        for (let i=1;i<xs.length;i++) gaps.push(xs[i]-xs[i-1]);
+        const median = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 5;
+        const maxDist = Math.max(2.0, median * 0.5); // seguro entre 2 y ~la mitad del gap
+        return { headerRowY: row.y, colCenters, maxDist };
       }
     }
   }
   return null;
 }
 
-// Dada una fila (cells con x/text), asigna valores numéricos a cada columna del header por cercanía en X
-function assignRowToColumns(row, colCenters) {
-  const result = { original:null, vigente:null, v1_29:0, v30_59:0, v60_89:0, v90_119:0, v120_179:0, v180p:0, hasTotales:false };
+// Mapea tokens numéricos a columnas por cercanía en X con umbral y hace backups
+function assignRowToColumns(row, colCenters, maxDist) {
+  const acc = {
+    original: [], vigente: [],
+    v1_29: [], v30_59: [], v60_89: [], v90_119: [], v120_179: [], v180p: [],
+    hasTotales: false,
+    numericByX: [] // para inferencias por orden
+  };
 
-  // ¿trae "Totales"?
-  if (row.cells.some(c => /Totales\s*:?/i.test(c.text))) {
-    result.hasTotales = true;
-  }
+  // Marca si la fila contiene "Totales"
+  if (row.cells.some(c => /Totales\s*:?/i.test(c.text))) acc.hasTotales = true;
 
-  // Por cada celda numérica, la enviamos a la columna con X más cercana (si existe)
+  // Recolecta números y los asigna si están cerca de alguna columna
   for (const c of row.cells) {
     const n = parseNumberMX(c.text);
     if (n === null) continue;
+    acc.numericByX.push({ x: c.x, n });
 
-    // Encuentra columna más cercana
     let bestKey = null, bestDist = Infinity;
     for (const [key, x] of Object.entries(colCenters)) {
       const d = Math.abs(c.x - x);
       if (d < bestDist) { bestDist = d; bestKey = key; }
     }
-    if (!bestKey) continue;
+    if (!bestKey || bestDist > maxDist) continue; // demasiado lejos, ignorar
 
-    if (bestKey === "original" || bestKey === "vigente") {
-      // en estas columnas esperamos un único valor; si aparece más de uno, nos quedamos con el último
-      result[bestKey] = n;
-    } else {
-      // buckets se acumulan por si el PDF divide la cifra en varios tokens
-      result[bestKey] = (result[bestKey] || 0) + n;
-    }
+    acc[bestKey].push(n);
   }
-  return result;
+
+  // Buckets: suma; Original/Vigente: toma el mayor valor no-nulo (evita terminar en 0 por fragmentación)
+  const sum = arr => (arr || []).reduce((a,b)=>a+(Number(b)||0), 0);
+  const maxVal = arr => (arr || []).reduce((m,v)=> (m==null || Math.abs(v)>Math.abs(m)) ? v : m, null);
+
+  let original = maxVal(acc.original);
+  let vigente  = maxVal(acc.vigente);
+  const buckets = {
+    v1_29:   sum(acc.v1_29),
+    v30_59:  sum(acc.v30_59),
+    v60_89:  sum(acc.v60_89),
+    v90_119: sum(acc.v90_119),
+    v120_179:sum(acc.v120_179),
+    v180p:   sum(acc.v180p),
+  };
+
+  // Backup por orden: en Totales, el 1º número suele ser Original y el 2º Vigente
+  if ((original == null || original === 0) || (vigente == null || vigente === 0)) {
+    const ordered = acc.numericByX.sort((a,b)=>a.x-b.x).map(o=>o.n);
+    if (ordered.length >= 1 && (original == null || original === 0)) original = ordered[0];
+    if (ordered.length >= 2 && (vigente  == null || vigente  === 0)) vigente  = ordered[1];
+  }
+
+  return { original, vigente, buckets, hasTotales: acc.hasTotales };
 }
 
-// Orquesta: localizar encabezado, luego recorrer filas hasta hallar "Totales"
+// Orquesta por coordenadas
 function extractTotalsByCoords(pdfData) {
   const hit = findActivosPage(pdfData);
   if (!hit) return null;
@@ -179,28 +172,22 @@ function extractTotalsByCoords(pdfData) {
   const header = findHeaderConfig(rows);
   if (!header) return null;
 
-  // Tomamos las filas DESPUÉS del encabezado, hasta que empiece otra sección o se acabe página
-  const startIdx = rows.findIndex(r => r.y === rows.find(rr => rr.y === header.headerRowY).y);
+  const { headerRowY, colCenters, maxDist } = header;
+
+  const startIdx = rows.findIndex(r => r.y === rows.find(rr => rr.y === headerRowY).y);
   const candidates = rows.slice(startIdx + 1);
 
   for (const row of candidates) {
     const line = textOfRow(row);
-    // Heurística de corte: si empieza otra sección grande (Resumen Créditos Activos, Créditos Liquidados, etc.)
+    // Corte si empieza otra sección
     if (/Resumen Cr[ée]ditos Activos|Cr[ée]ditos Liquidados|INFORMACI[ÓO]N COMERCIAL/i.test(line)) break;
 
-    const mapped = assignRowToColumns(row, header.colCenters);
+    const mapped = assignRowToColumns(row, colCenters, maxDist);
     if (mapped.hasTotales) {
       return {
         original: mapped.original,
         vigente:  mapped.vigente,
-        buckets: {
-          v1_29: mapped.v1_29 || 0,
-          v30_59: mapped.v30_59 || 0,
-          v60_89: mapped.v60_89 || 0,
-          v90_119: mapped.v90_119 || 0,
-          v120_179: mapped.v120_179 || 0,
-          v180p: mapped.v180p || 0,
-        }
+        buckets:  mapped.buckets,
       };
     }
   }
@@ -264,6 +251,34 @@ function extractBuckets(lines) {
     }
   }
   return out;
+}
+
+/* ======================== ARMADO DE RESPUESTA ======================== */
+function buildResult({ original, vigente, buckets, multiplier, fuente }) {
+  const vencido =
+    (buckets.v1_29 || 0) +
+    (buckets.v30_59 || 0) +
+    (buckets.v60_89 || 0) +
+    (buckets.v90_119 || 0) +
+    (buckets.v120_179 || 0) +
+    (buckets.v180p || 0);
+
+  return {
+    montoOriginal: original != null ? original * multiplier : null,
+    saldoVigente: vigente != null ? vigente * multiplier : null,
+    buckets: {
+      "1_29":    (buckets.v1_29   || 0) * multiplier,
+      "30_59":   (buckets.v30_59  || 0) * multiplier,
+      "60_89":   (buckets.v60_89  || 0) * multiplier,
+      "90_119":  (buckets.v90_119 || 0) * multiplier,
+      "120_179": (buckets.v120_179|| 0) * multiplier,
+      "180_mas": (buckets.v180p   || 0) * multiplier,
+    },
+    saldoVencido: vencido * multiplier,
+    saldoTotal: (vigente != null ? vigente * multiplier : 0) + vencido * multiplier,
+    unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
+    fuente,
+  };
 }
 
 /* ======================== HANDLER ======================== */
