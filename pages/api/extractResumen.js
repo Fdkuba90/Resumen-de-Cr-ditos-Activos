@@ -113,42 +113,60 @@ function extractBuckets(lines) {
 }
 
 /* ========== NUEVO: Totales de “Créditos Activos / Capital + Intereses” ========== */
+/*  Patch: tomar SOLO la línea de "Totales:" o, si hace falta, la línea previa.
+    Evita mezclar con filas como "89 87 ..." que pueden estar arriba. */
 function extractActivosTotals(lines) {
-  let lastSectionIdx = -1;
+  let sectionStart = -1;
+
+  // util local: toma números de una línea y regresa los últimos 8 como [orig, vig, b1..b6]
+  function takeFromLine(line) {
+    const nums = (line.match(/[-$()0-9.,]+/g) || [])
+      .map(parseNumberMX)
+      .filter((v) => v !== null);
+    if (nums.length < 2) return null;
+    const take = nums.slice(-8);
+    while (take.length < 8) take.push(0);
+    const [original, vigente, b1, b2, b3, b4, b5, b6] = take;
+    return {
+      original,
+      vigente,
+      buckets: {
+        v1_29: b1 || 0,
+        v30_59: b2 || 0,
+        v60_89: b3 || 0,
+        v90_119: b4 || 0,
+        v120_179: b5 || 0,
+        v180p:  b6 || 0,
+      },
+    };
+  }
+
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
-    if (/(Cr[ée]ditos Activos|Capital \+\s*Intereses)/i.test(ln)) {
-      lastSectionIdx = i;
-    }
-    if (/Totales\s*:?/i.test(ln) && lastSectionIdx !== -1 && i - lastSectionIdx < 180) {
-      const window = [
-        lines[i - 2] || "",
-        lines[i - 1] || "",
-        lines[i] || "",
-        lines[i + 1] || "",
-      ].join(" ");
-      const before = window.split(/Totales\s*:/i)[0] || "";
-      const nums = (before.match(/[-$()0-9.,]+/g) || [])
-        .map(parseNumberMX)
-        .filter((v) => v !== null);
 
-      if (nums.length >= 2) {
-        const take = nums.slice(-8);
-        while (take.length < 8) take.unshift(0);
-        const [original, vigente, b1, b2, b3, b4, b5, b6] = take;
-        return {
-          original,
-          vigente,
-          buckets: {
-            v1_29: b1 || 0,
-            v30_59: b2 || 0,
-            v60_89: b3 || 0,
-            v90_119: b4 || 0,
-            v120_179: b5 || 0,
-            v180p: b6 || 0,
-          },
-        };
-      }
+    // Marca el inicio de la sección correcta
+    if (/(Cr[ée]ditos Activos|Capital \+\s*Intereses)/i.test(ln)) {
+      sectionStart = i;
+    }
+
+    // Solo buscamos "Totales:" dentro de esa sección (ventana razonable)
+    if (/Totales\s*:?/i.test(ln) && sectionStart !== -1 && i - sectionStart < 180) {
+      // A) MismA línea: números antes de "Totales:"
+      const beforeSameLine = ln.split(/Totales\s*:/i)[0] || "";
+      let res = takeFromLine(beforeSameLine);
+      if (res) return res;
+
+      // B) Solo la línea previa (algunas plantillas separan la etiqueta)
+      const prev = lines[i - 1] || "";
+      res = takeFromLine(prev);
+      if (res) return res;
+
+      // C) Combinado conservador: previa + misma (en ese orden)
+      const combined = (prev + " " + beforeSameLine).trim();
+      res = takeFromLine(combined);
+      if (res) return res;
+
+      // Si no, seguimos buscando por si hay otra coincidencia
     }
   }
   return null;
@@ -167,12 +185,12 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
     montoOriginal: original != null ? original * multiplier : null,
     saldoVigente: vigente != null ? vigente * multiplier : null,
     buckets: {
-      "1_29": (buckets.v1_29 || 0) * multiplier,
-      "30_59": (buckets.v30_59 || 0) * multiplier,
-      "60_89": (buckets.v60_89 || 0) * multiplier,
+      "1_29":   (buckets.v1_29   || 0) * multiplier,
+      "30_59":  (buckets.v30_59  || 0) * multiplier,
+      "60_89":  (buckets.v60_89  || 0) * multiplier,
       "90_119": (buckets.v90_119 || 0) * multiplier,
-      "120_179": (buckets.v120_179 || 0) * multiplier,
-      "180_mas": (buckets.v180p || 0) * multiplier,
+      "120_179":(buckets.v120_179|| 0) * multiplier,
+      "180_mas":(buckets.v180p   || 0) * multiplier,
     },
     saldoVencido: vencido * multiplier,
     saldoTotal:
@@ -228,15 +246,19 @@ export default async function handler(req, res) {
             multiplier,
             fuente: "Totales de Créditos Activos",
           });
-          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
+          return res.status(200).json({
+            ok: true,
+            meta: { milesDePesosDetectado: multiplier === 1000 },
+            data: payload,
+          });
         }
 
-        // Si el usuario exige solo Totales, error si no existe
+        // 2) Si el usuario exige solo Totales, error si no existe
         if (onlyTotals) {
           return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
         }
 
-        // 2) Fallback por etiquetas
+        // 3) Fallback por etiquetas
         const original = extractSingleLabeled(lines, /\boriginal\b/i);
         const vigente = extractSingleLabeled(lines, /\bvigente\b/i);
         const buckets = extractBuckets(lines);
