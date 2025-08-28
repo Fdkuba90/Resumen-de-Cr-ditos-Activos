@@ -44,7 +44,8 @@ function findActivosPage(pdfData) {
   for (let p = 0; p < pages.length; p++) {
     const rows = pageToRows(pages[p], 0.35);
     const joined = rows.map(textOfRow).join("\n");
-    if (/Cr[ée]ditos Activos/i.test(joined) && /Capital\s*\+\s*Intereses/i.test(joined)) {
+    // Acepta variaciones: algunos traen el bloque sin “Capital + Intereses” explícito
+    if (/Cr[ée]ditos Activos/i.test(joined) || (/Original/i.test(joined) && /Vigente/i.test(joined))) {
       return { pageIndex: p, rows };
     }
   }
@@ -63,7 +64,7 @@ const HEADER_COLS = [
   { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
 ];
 
-// Header multi-línea (combina hasta 3 renglones) + centros de columna + tolerancia dinámica
+// Header multi-línea + centros de columna + tolerancia dinámica
 function findHeaderConfig(rows) {
   for (let i = 0; i < rows.length; i++) {
     const r0 = rows[i];
@@ -114,14 +115,14 @@ function findHeaderConfig(rows) {
   return null;
 }
 
-// Asigna por cercanía en X; además guarda todos los números ordenados por X para fallback por orden
+// Asigna por cercanía en X; guarda también los números ordenados por X para fallback por orden
 function assignRowToColumns(row, colCenters, maxDist) {
   const acc = {
     original: [], vigente: [],
     v1_29: [], v30_59: [], v60_89: [], v90_119: [], v120_179: [], v180p: [],
     hasTotales: false, numericByX: []
   };
-  if (row.cells.some(c => /Totales\s*:?/i.test(c.text))) acc.hasTotales = true;
+  if (row.cells.some(c => /(Total(?:es)?)\s*:?/i.test(c.text))) acc.hasTotales = true;
 
   for (const c of row.cells) {
     const n = parseNumberMX(c.text);
@@ -152,14 +153,13 @@ function assignRowToColumns(row, colCenters, maxDist) {
   };
 
   // -------- Fallback por ORDEN FIJO (8 columnas) --------
-  // Si falta cualquiera de los buckets o (original/vigente) pero hay suficientes números en la fila, rellenamos por orden.
   const ordered = acc.numericByX.sort((a,b)=>a.x-b.x).map(o=>o.n); // izquierda -> derecha
   if (ordered.length >= 2) {
     if (original == null || original === 0) original = ordered[0];
     if (vigente  == null || vigente  === 0) vigente  = ordered[1];
   }
   const fillIfZero = (cur, idx) => (cur && cur !== 0) ? cur : (ordered.length > idx ? ordered[idx] : cur);
-  // índices en ordered: 0:O, 1:V, 2:1-29, 3:30-59, 4:60-89, 5:90-119, 6:120-179, 7:180+
+  // 0:O, 1:V, 2:1-29, 3:30-59, 4:60-89, 5:90-119, 6:120-179, 7:180+
   buckets.v1_29   = fillIfZero(buckets.v1_29,   2);
   buckets.v30_59  = fillIfZero(buckets.v30_59,  3);
   buckets.v60_89  = fillIfZero(buckets.v60_89,  4);
@@ -194,7 +194,54 @@ function extractTotalsByCoords(pdfData) {
   return null;
 }
 
-/* ======================== FALLBACKS (texto) ======================== */
+/* ======================== “MODO BRIDOVA” (texto robusto) ======================== */
+/* Busca líneas cercanas a 'Totales' donde los 8 números estén antes o después,
+   incluso con ceros pegados tipo "0057338 00 005733880225 0029 29". */
+function extractTotalsBridova(allText) {
+  const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const idxs = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/(Total(?:es)?)\s*:?/i.test(lines[i])) idxs.push(i);
+  }
+  if (!idxs.length) return null;
+
+  const tryParseLine = (line) => {
+    // aceptamos números con comas/puntos/ceros a la izquierda
+    const raw = (line.match(/[-$()0-9.,]+/g) || []).map(t => t.replace(/[^\d()-]/g, ""));
+    const cleaned = raw
+      .map(t => t.replace(/[(),]/g, ""))   // quita separadores
+      .map(t => t.replace(/^0+(\d)/, "$1")) // quita ceros líderes
+      .map(t => parseInt(t || "0", 10))
+      .filter(n => !Number.isNaN(n));
+    if (cleaned.length < 2) return null;
+    // tomar los ÚLTIMOS 8 valores (algunos formatos ponen ceros extra al principio)
+    const take = cleaned.slice(-8);
+    while (take.length < 8) take.unshift(0);
+    const [original, vigente, b1,b2,b3,b4,b5,b6] = take;
+    return {
+      original, vigente,
+      buckets: { v1_29:b1||0, v30_59:b2||0, v60_89:b3||0, v90_119:b4||0, v120_179:b5||0, v180p:b6||0 }
+    };
+  };
+
+  // Explora línea con "Totales" y sus vecinas (arriba/abajo) por si la palabra cae separada
+  for (const i of idxs) {
+    const candidates = [
+      lines[i],
+      lines[i-1] || "",
+      lines[i+1] || "",
+      ((lines[i-1]||"") + " " + lines[i]).trim(),
+      ((lines[i]||"") + " " + (lines[i+1]||"")).trim(),
+    ];
+    for (const c of candidates) {
+      const res = tryParseLine(c);
+      if (res) return res;
+    }
+  }
+  return null;
+}
+
+/* ======================== FALLBACKS (texto clásico) ======================== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -203,6 +250,14 @@ function extractSingleLabeled(lines, labelRegex) {
       if (nums) {
         const candidates = nums.map(parseNumberMX).filter((v) => v !== null);
         if (candidates.length) return candidates[candidates.length - 1];
+      }
+      for (let k = 1; k <= 3 && i + k < lines.length; k++) {
+        const ln = lines[i + k];
+        const cand = ln.match(/[-$()0-9.,]+/g);
+        if (cand) {
+          const vals = cand.map(parseNumberMX).filter((v) => v !== null);
+          if (vals.length) return vals[vals.length - 1];
+        }
       }
     }
   }
@@ -287,38 +342,51 @@ export default async function handler(req, res) {
 
     pdfParser.on("pdfParser_dataReady", (pdfData) => {
       try {
+        // Texto normalizado para detectar “miles de pesos” y para fallbacks textuales
         const allText = normalizeSpaces(
           (pdfData.Pages || []).map(p => pageToRows(p).map(textOfRow).join("\n")).join("\n")
         );
         const multiplier = detectMilesDePesos(allText) ? 1000 : 1;
 
-        const totals = extractTotalsByCoords(pdfData);
-        if (totals) {
+        // ===== 1) Método principal: COORDENADAS (fila Totales) =====
+        const totalsCoords = extractTotalsByCoords(pdfData);
+        if (totalsCoords) {
           const payload = buildResult({
-            original: totals.original,
-            vigente: totals.vigente,
-            buckets: totals.buckets,
+            original: totalsCoords.original,
+            vigente: totalsCoords.vigente,
+            buckets: totalsCoords.buckets,
             multiplier,
-            fuente: "Totales de Créditos Activos (por coordenadas)"
+            fuente: "Totales de Créditos Activos (por coordenadas)",
           });
           return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
         }
 
+        // ===== 2) Modo Bridova (texto robusto con Totales antes/después, ceros pegados) =====
+        const totalsBridova = extractTotalsBridova(allText);
+        if (totalsBridova) {
+          const payload = buildResult({
+            original: totalsBridova.original,
+            vigente: totalsBridova.vigente,
+            buckets: totalsBridova.buckets,
+            multiplier,
+            fuente: "Totales (modo Bridova)",
+          });
+          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
+        }
+
+        // ===== 3) Si exige solo Totales, error si no hay =====
         if (onlyTotals) {
           return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
         }
 
+        // ===== 4) Fallback clásico por etiquetas (menos confiable) =====
         const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
         const original = extractSingleLabeled(lines, /\boriginal\b/i);
-        const vigente = extractSingleLabeled(lines, /\bvigente\b/i);
-        const buckets = extractBuckets(lines);
+        const vigente  = extractSingleLabeled(lines, /\bvigente\b/i);
+        const buckets  = extractBuckets(lines);
 
         const payload = buildResult({
-          original,
-          vigente,
-          buckets,
-          multiplier,
-          fuente: "Fallback por etiquetas (texto)"
+          original, vigente, buckets, multiplier, fuente: "Fallback por etiquetas (texto)"
         });
         return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
       } catch (e) {
