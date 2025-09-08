@@ -1,11 +1,14 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "next.config.js",
-      "use": "@vercel/next"
-    }
+    { "src": "next.config.js", "use": "@vercel/next" }
   ],
+  "functions": {
+    "api/**.js": {
+      "maxDuration": 20,
+      "memory": 1024
+    }
+  },
   "routes": [
     { "src": "/(.*)", "dest": "/$1" }
   ]
