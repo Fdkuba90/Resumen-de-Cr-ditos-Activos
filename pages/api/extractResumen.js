@@ -44,7 +44,6 @@ function findActivosPage(pdfData) {
   for (let p = 0; p < pages.length; p++) {
     const rows = pageToRows(pages[p], 0.35);
     const joined = rows.map(textOfRow).join("\n");
-    // Acepta variaciones: algunos traen el bloque sin “Capital + Intereses” explícito
     if (/Cr[ée]ditos Activos/i.test(joined) || (/Original/i.test(joined) && /Vigente/i.test(joined))) {
       return { pageIndex: p, rows };
     }
@@ -52,7 +51,7 @@ function findActivosPage(pdfData) {
   return null;
 }
 
-/* ======================== EXTRACCIÓN POR COORDENADAS ======================== */
+/* ======================== EXTRACCIÓN POR COORDENADAS (TOTALES) ======================== */
 const HEADER_COLS = [
   { key: "original",   re: /\boriginal\b/i },
   { key: "vigente",    re: /\bvigente\b/i },
@@ -90,7 +89,6 @@ function findHeaderConfig(rows) {
     }
     if (colCenters.original == null || colCenters.vigente == null) continue;
 
-    // Completa centros faltantes estimando espaciado
     const known = Object.entries(colCenters).sort((a,b)=>a[1]-b[1]);
     const xs = known.map(([,x])=>x);
     const gaps = []; for (let k=1;k<xs.length;k++) gaps.push(xs[k]-xs[k-1]);
@@ -134,7 +132,7 @@ function assignRowToColumns(row, colCenters, maxDist) {
       const d = Math.abs(c.x - x);
       if (d < bestDist) { bestDist = d; bestKey = key; }
     }
-    if (!bestKey || bestDist > maxDist) continue; // demasiado lejos para asignar
+    if (!bestKey || bestDist > maxDist) continue;
     acc[bestKey].push(n);
   }
 
@@ -195,8 +193,6 @@ function extractTotalsByCoords(pdfData) {
 }
 
 /* ======================== “MODO BRIDOVA” (texto robusto) ======================== */
-/* Busca líneas cercanas a 'Totales' donde los 8 números estén antes o después,
-   incluso con ceros pegados tipo "0057338 00 005733880225 0029 29". */
 function extractTotalsBridova(allText) {
   const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const idxs = [];
@@ -206,15 +202,13 @@ function extractTotalsBridova(allText) {
   if (!idxs.length) return null;
 
   const tryParseLine = (line) => {
-    // aceptamos números con comas/puntos/ceros a la izquierda
     const raw = (line.match(/[-$()0-9.,]+/g) || []).map(t => t.replace(/[^\d()-]/g, ""));
     const cleaned = raw
-      .map(t => t.replace(/[(),]/g, ""))   // quita separadores
-      .map(t => t.replace(/^0+(\d)/, "$1")) // quita ceros líderes
+      .map(t => t.replace(/[(),]/g, ""))
+      .map(t => t.replace(/^0+(\d)/, "$1"))
       .map(t => parseInt(t || "0", 10))
       .filter(n => !Number.isNaN(n));
     if (cleaned.length < 2) return null;
-    // tomar los ÚLTIMOS 8 valores (algunos formatos ponen ceros extra al principio)
     const take = cleaned.slice(-8);
     while (take.length < 8) take.unshift(0);
     const [original, vigente, b1,b2,b3,b4,b5,b6] = take;
@@ -224,7 +218,6 @@ function extractTotalsBridova(allText) {
     };
   };
 
-  // Explora línea con "Totales" y sus vecinas (arriba/abajo) por si la palabra cae separada
   for (const i of idxs) {
     const candidates = [
       lines[i],
@@ -288,7 +281,7 @@ function extractBuckets(lines) {
   return out;
 }
 
-/* ======================== RESPUESTA ======================== */
+/* ======================== RESPUESTA (TOTALES) ======================== */
 function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
@@ -314,6 +307,160 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
     unidades: multiplier === 1000 ? "pesos (convertido desde miles)" : "pesos",
     fuente,
   };
+}
+
+/* ======================== HISTORIA (serie mensual) ======================== */
+// Meses y regex
+const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
+const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
+
+function toPeriodo(token) {
+  const [mes, anio] = token.trim().split(/\s+/);
+  const mm = MONTHS[mes];
+  if (!mm) return null;
+  return `${anio}-${mm}`;
+}
+function parseCalifTokens(text) {
+  if (!text) return [];
+  const t = (text.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
+  return t;
+}
+function nearestNumberAtX(row, x, tol = 2.5) {
+  let best = null, bestDist = Infinity;
+  for (const c of row.cells) {
+    const n = parseNumberMX(c.text);
+    if (n == null) continue;
+    const d = Math.abs(c.x - x);
+    if (d < bestDist) { bestDist = d; best = n; }
+  }
+  return bestDist <= tol ? best : 0;
+}
+function nearestTextAtX(row, x, tol = 2.8) {
+  let best = null, bestDist = Infinity;
+  for (const c of row.cells) {
+    const d = Math.abs(c.x - x);
+    if (d < bestDist) { bestDist = d; best = c.text; }
+  }
+  return bestDist <= tol ? best : "";
+}
+
+// Detecta bloques de encabezado de meses y mapea las 6 filas siguientes (vigente, 4 buckets, calificación)
+function extractHistoriaFromPdf(pdfData) {
+  const pages = pdfData.Pages || [];
+  const map = new Map(); // periodo -> rec
+
+  for (const pg of pages) {
+    const rows = pageToRows(pg, 0.35);
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const monthCells = r.cells.filter(c => MES_RE.test(c.text));
+      if (!monthCells.length) continue;
+
+      // Columnas de meses detectadas en esta banda
+      const months = monthCells
+        .map(c => ({ x: c.x, label: c.text.trim(), periodo: toPeriodo(c.text.trim()) }))
+        .filter(m => !!m.periodo)
+        .sort((a,b)=>a.x-b.x);
+
+      // Tolerancia horizontal basada en distancia mediana entre meses
+      const gaps = []; for (let k = 1; k < months.length; k++) gaps.push(months[k].x - months[k-1].x);
+      const tol = Math.max(2.2, (gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6) * 0.45);
+
+      // Buscar filas de métricas cerca
+      const metrics = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
+      for (let j = i + 1; j < Math.min(i + 12, rows.length); j++) {
+        const line = textOfRow(rows[j]);
+        if (MES_RE.test(line)) break; // nuevo bloque de meses
+        if (!metrics.vigente && /\bVigente\b/i.test(line)) metrics.vigente = rows[j];
+        else if (!metrics.v1_29 && /Vencido.*(1\s*a\s*29|1\s*[–-]\s*29)\s*d[ií]as?/i.test(line)) metrics.v1_29 = rows[j];
+        else if (!metrics.v30_59 && /Vencido.*(30\s*a\s*59|30\s*[–-]\s*59)\s*d[ií]as?/i.test(line)) metrics.v30_59 = rows[j];
+        else if (!metrics.v60_89 && /Vencido.*(60\s*a\s*89|60\s*[–-]\s*89)\s*d[ií]as?/i.test(line)) metrics.v60_89 = rows[j];
+        else if (!metrics.v90_mas && /(Vencido.*(m[aá]s\s*de\s*89|90\+|89\+))|Vencido.*(90\s*y\s*m[aá]s)/i.test(line)) metrics.v90_mas = rows[j];
+        else if (!metrics.calif && /Calificaci[oó]n de Cartera/i.test(line)) metrics.calif = rows[j];
+      }
+
+      // Armar registros por mes
+      for (const m of months) {
+        const rec = {
+          periodo: m.periodo,
+          vigente: metrics.vigente ? nearestNumberAtX(metrics.vigente, m.x, tol) : 0,
+          venc_1_29: metrics.v1_29 ? nearestNumberAtX(metrics.v1_29, m.x, tol) : 0,
+          venc_30_59: metrics.v30_59 ? nearestNumberAtX(metrics.v30_59, m.x, tol) : 0,
+          venc_60_89: metrics.v60_89 ? nearestNumberAtX(metrics.v60_89, m.x, tol) : 0,
+          venc_90_mas: metrics.v90_mas ? nearestNumberAtX(metrics.v90_mas, m.x, tol) : 0,
+          calificacion_cartera: metrics.calif ? parseCalifTokens(nearestTextAtX(metrics.calif, m.x, Math.max(2.8, tol))) : [],
+          total_mes: 0,
+          sin_atrasos: true
+        };
+        const venc = (rec.venc_1_29||0)+(rec.venc_30_59||0)+(rec.venc_60_89||0)+(rec.venc_90_mas||0);
+        rec.total_mes = (rec.vigente||0) + venc;
+        rec.sin_atrasos = venc === 0;
+
+        // Guardar último valor si el mes aparece dos veces en la página (bloques apilados)
+        map.set(rec.periodo, rec);
+      }
+    }
+  }
+
+  // Ordenar por periodo ascendente
+  const out = Array.from(map.values()).sort((a,b)=>a.periodo.localeCompare(b.periodo));
+  return out;
+}
+
+function applyMultiplierHistoria(rows, multiplier) {
+  return (rows || []).map(r => ({
+    ...r,
+    vigente: (r.vigente || 0) * multiplier,
+    venc_1_29: (r.venc_1_29 || 0) * multiplier,
+    venc_30_59: (r.venc_30_59 || 0) * multiplier,
+    venc_60_89: (r.venc_60_89 || 0) * multiplier,
+    venc_90_mas: (r.venc_90_mas || 0) * multiplier,
+    total_mes: (r.total_mes || 0) * multiplier
+  }));
+}
+
+function computeKPIsHistoria(rows) {
+  if (!rows?.length) {
+    return {
+      mesesConAtraso: 0,
+      peorBucket: "sin datos",
+      mesPeorBucket: null,
+      ratiosVencidoSobreVigente: [],
+      sumasPorBucket: { "1_29":0, "30_59":0, "60_89":0, "90_mas":0 },
+      mesesDesdeUltimo90mas: null
+    };
+  }
+  const last12 = rows.slice(-12);
+  const mesesConAtraso = last12.filter(r => (r.venc_1_29+r.venc_30_59+r.venc_60_89+r.venc_90_mas) > 0).length;
+
+  let worstLevel = -1, peorBucket = "sin atraso", mesPeorBucket = null;
+  function level(r){
+    return r.venc_90_mas>0?4:r.venc_60_89>0?3:r.venc_30_59>0?2:r.venc_1_29>0?1:0;
+  }
+  for (const r of last12) {
+    const lv = level(r);
+    if (lv > worstLevel) { worstLevel = lv; peorBucket = lv===4?"90+":lv===3?"60-89":lv===2?"30-59":lv===1?"1-29":"sin atraso"; mesPeorBucket = r.periodo; }
+  }
+
+  const ratiosVencidoSobreVigente = last12.map(r => ({
+    periodo: r.periodo,
+    ratio: r.vigente ? Math.round(((r.venc_1_29+r.venc_30_59+r.venc_60_89+r.venc_90_mas)/r.vigente)*10000)/100 : null
+  }));
+
+  const sumasPorBucket = last12.reduce((acc,r)=>({
+    "1_29": acc["1_29"] + (r.venc_1_29||0),
+    "30_59": acc["30_59"] + (r.venc_30_59||0),
+    "60_89": acc["60_89"] + (r.venc_60_89||0),
+    "90_mas": acc["90_mas"] + (r.venc_90_mas||0)
+  }), { "1_29":0, "30_59":0, "60_89":0, "90_mas":0 });
+
+  let mesesDesdeUltimo90mas = null;
+  for (let i = last12.length - 1; i >= 0; i--) {
+    if (last12[i].venc_90_mas > 0) { mesesDesdeUltimo90mas = last12.length - 1 - i; break; }
+  }
+
+  return { mesesConAtraso, peorBucket, mesPeorBucket, ratiosVencidoSobreVigente, sumasPorBucket, mesesDesdeUltimo90mas };
 }
 
 /* ======================== HANDLER ======================== */
@@ -342,53 +489,58 @@ export default async function handler(req, res) {
 
     pdfParser.on("pdfParser_dataReady", (pdfData) => {
       try {
-        // Texto normalizado para detectar “miles de pesos” y para fallbacks textuales
         const allText = normalizeSpaces(
           (pdfData.Pages || []).map(p => pageToRows(p).map(textOfRow).join("\n")).join("\n")
         );
         const multiplier = detectMilesDePesos(allText) ? 1000 : 1;
 
-        // ===== 1) Método principal: COORDENADAS (fila Totales) =====
+        // ===== Totales (misma lógica de antes) =====
+        let payload = null;
+
         const totalsCoords = extractTotalsByCoords(pdfData);
         if (totalsCoords) {
-          const payload = buildResult({
+          payload = buildResult({
             original: totalsCoords.original,
             vigente: totalsCoords.vigente,
             buckets: totalsCoords.buckets,
             multiplier,
             fuente: "Totales de Créditos Activos (por coordenadas)",
           });
-          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
+        } else {
+          const totalsBridova = extractTotalsBridova(allText);
+          if (totalsBridova) {
+            payload = buildResult({
+              original: totalsBridova.original,
+              vigente: totalsBridova.vigente,
+              buckets: totalsBridova.buckets,
+              multiplier,
+              fuente: "Totales (modo Bridova)",
+            });
+          } else if (onlyTotals) {
+            // Si el cliente pidió solo totales, no seguimos con historia.
+            return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
+          } else {
+            // Fallback por etiquetas
+            const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
+            const original = extractSingleLabeled(lines, /\boriginal\b/i);
+            const vigente  = extractSingleLabeled(lines, /\bvigente\b/i);
+            const buckets  = extractBuckets(lines);
+            payload = buildResult({ original, vigente, buckets, multiplier, fuente: "Fallback por etiquetas (texto)" });
+          }
         }
 
-        // ===== 2) Modo Bridova (texto robusto con Totales antes/después, ceros pegados) =====
-        const totalsBridova = extractTotalsBridova(allText);
-        if (totalsBridova) {
-          const payload = buildResult({
-            original: totalsBridova.original,
-            vigente: totalsBridova.vigente,
-            buckets: totalsBridova.buckets,
-            multiplier,
-            fuente: "Totales (modo Bridova)",
-          });
-          return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
-        }
+        // ===== Historia (nuevo) =====
+        const histRaw = extractHistoriaFromPdf(pdfData);
+        const historia = applyMultiplierHistoria(histRaw, multiplier);
+        const kpisHistoria = computeKPIsHistoria(historia);
 
-        // ===== 3) Si exige solo Totales, error si no hay =====
-        if (onlyTotals) {
-          return res.status(422).json({ ok: false, error: "No se encontró la fila 'Totales' en Créditos Activos." });
-        }
-
-        // ===== 4) Fallback clásico por etiquetas (menos confiable) =====
-        const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
-        const original = extractSingleLabeled(lines, /\boriginal\b/i);
-        const vigente  = extractSingleLabeled(lines, /\bvigente\b/i);
-        const buckets  = extractBuckets(lines);
-
-        const payload = buildResult({
-          original, vigente, buckets, multiplier, fuente: "Fallback por etiquetas (texto)"
+        return res.status(200).json({
+          ok: true,
+          meta: { milesDePesosDetectado: multiplier === 1000 },
+          data: payload,
+          historia,
+          kpisHistoria
         });
-        return res.status(200).json({ ok: true, meta: { milesDePesosDetectado: multiplier === 1000 }, data: payload });
       } catch (e) {
         console.error(e);
         return res.status(500).json({ error: "Fallo al extraer los datos", detalle: String(e) });
