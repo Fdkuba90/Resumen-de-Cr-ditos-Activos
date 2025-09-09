@@ -5,11 +5,30 @@ import PDFParser from "pdf2json";
 
 export const config = { api: { bodyParser: false } };
 
-/* ======================== UTILIDADES ======================== */
+/* ======================== UTILIDADES BÁSICAS ======================== */
 function decodeTxt(t = "") { try { return decodeURIComponent(t); } catch { return t; } }
 function normalizeSpaces(s = "") {
   return (s || "").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim();
 }
+function parseNumberMX(str) {
+  if (str == null) return null;
+  let s = String(str).replace(/\u00A0/g, " ").trim();
+  s = s.replace(/\s/g, "").replace(/\$/g, "");
+  const neg = /^\(.*\)$/.test(s);
+  s = s.replace(/[(),]/g, "");
+  if (!s || isNaN(Number(s))) return null;
+  const n = Number(s);
+  return neg ? -n : n;
+}
+function parseNumberLoose(str) {
+  if (str == null) return null;
+  const m = String(str).match(/[-$()0-9.,]+/);
+  if (!m) return null;
+  return parseNumberMX(m[0]);
+}
+function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
+
+/* ======================== FILAS (para localizar secciones) ======================== */
 function pageToRows(page, yTol = 0.35) {
   const rows = [];
   for (const t of page.Texts || []) {
@@ -25,27 +44,9 @@ function pageToRows(page, yTol = 0.35) {
   for (const r of rows) r.cells.sort((a,b) => a.x - b.x);
   return rows;
 }
-function parseNumberMX(str) {
-  if (str == null) return null;
-  let s = String(str).replace(/\u00A0/g, " ").trim();
-  s = s.replace(/\s/g, "").replace(/\$/g, "");
-  const neg = /^\(.*\)$/.test(s);
-  s = s.replace(/[(),]/g, "");
-  if (!s || isNaN(Number(s))) return null;
-  const n = Number(s);
-  return neg ? -n : n;
-}
-// NUEVO: toma el 1er token numérico aunque esté pegado a letras (p. ej. "42942Vigente")
-function parseNumberLoose(str) {
-  if (str == null) return null;
-  const m = String(str).match(/[-$()0-9.,]+/);
-  if (!m) return null;
-  return parseNumberMX(m[0]);
-}
-function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
 function textOfRow(row) { return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim(); }
 
-/* ======================== UBICACIÓN DE LA TABLA ======================== */
+/* ======================== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ======================== */
 function findActivosPage(pdfData) {
   const pages = pdfData.Pages || [];
   for (let p = 0; p < pages.length; p++) {
@@ -58,7 +59,7 @@ function findActivosPage(pdfData) {
   return null;
 }
 
-/* ======================== EXTRACCIÓN POR COORDENADAS (TOTALES) ======================== */
+/* ======================== TOTALES POR COORDENADAS ======================== */
 const HEADER_COLS = [
   { key: "original",   re: /\boriginal\b/i },
   { key: "vigente",    re: /\bvigente\b/i },
@@ -86,12 +87,10 @@ function findHeaderConfig(rows) {
 
     const colCenters = {};
     for (const col of HEADER_COLS) {
-      let best = null;
       for (const c of merged.cells) {
         const txt = c.text.replace(/\s+/g, " ");
-        if (col.re.test(txt)) { best = c; break; }
+        if (col.re.test(txt)) { colCenters[col.key] = c.x; break; }
       }
-      if (best) colCenters[col.key] = best.x;
     }
     if (colCenters.original == null || colCenters.vigente == null) continue;
 
@@ -114,6 +113,7 @@ function findHeaderConfig(rows) {
   }
   return null;
 }
+
 function assignRowToColumns(row, colCenters, maxDist) {
   const acc = {
     original: [], vigente: [],
@@ -123,7 +123,7 @@ function assignRowToColumns(row, colCenters, maxDist) {
   if (row.cells.some(c => /(Total(?:es)?)\s*:?/i.test(c.text))) acc.hasTotales = true;
 
   for (const c of row.cells) {
-    const n = parseNumberLoose(c.text); // <-- suelto
+    const n = parseNumberLoose(c.text);
     if (n === null) continue;
     acc.numericByX.push({ x: c.x, n });
 
@@ -165,6 +165,7 @@ function assignRowToColumns(row, colCenters, maxDist) {
 
   return { original, vigente, buckets, hasTotales: acc.hasTotales };
 }
+
 function extractTotalsByCoords(pdfData) {
   const hit = findActivosPage(pdfData);
   if (!hit) return null;
@@ -189,7 +190,7 @@ function extractTotalsByCoords(pdfData) {
   return null;
 }
 
-/* ======================== “MODO BRIDOVA” (texto robusto) ======================== */
+/* ======================== “MODO BRIDOVA” (Totales por texto) ======================== */
 function extractTotalsBridova(allText) {
   const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const idxs = [];
@@ -272,7 +273,7 @@ function extractBuckets(lines) {
   return out;
 }
 
-/* ======================== RESPUESTA (TOTALES) ======================== */
+/* ======================== RESPUESTA (Totales) ======================== */
 function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
@@ -300,7 +301,7 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   };
 }
 
-/* ======================== HISTORIA (grid + merge filas + fallback) ======================== */
+/* ======================== HISTORIA (por bandas Y + columnas X) ======================== */
 const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
 const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
 
@@ -319,79 +320,79 @@ function toPeriodo(token) {
   return mm ? `${anio}-${mm}` : null;
 }
 
-// Combina la fila base con vecinas (±N) si |Δy| <= maxDy
-function mergeWithNeighbors(rows, baseIdx, span = 2, maxDy = 1.4) {
-  const base = rows[baseIdx];
-  const merged = { y: base.y, cells: [...base.cells] };
-  for (let k = 1; k <= span; k++) {
-    const prev = rows[baseIdx - k], next = rows[baseIdx + k];
-    if (prev && Math.abs(prev.y - base.y) <= maxDy) merged.cells.push(...prev.cells);
-    if (next && Math.abs(next.y - base.y) <= maxDy) merged.cells.push(...next.cells);
+// tokens crudos de una página
+function tokensOfPage(pg) {
+  const out = [];
+  for (const t of (pg.Texts || [])) {
+    const text = (t.R || []).map(r => decodeTxt(r.T)).join("");
+    if (!text.trim()) continue;
+    out.push({ x: t.x, y: t.y, text });
   }
-  merged.cells.sort((a,b)=>a.x-b.x);
-  return merged;
+  return out;
 }
 
-// límites por columna; extremos más anchos
+// bordes por columna (centros -> límites). Extremos más anchos.
 function columnBoundaries(xCenters) {
   const xs = [...xCenters].sort((a,b)=>a-b);
   const gaps = []; for (let i = 1; i < xs.length; i++) gaps.push(xs[i]-xs[i-1]);
   const medianGap = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6;
-  const pad = medianGap * 0.6; // ensanchar extremos
 
   return xs.map((x, idx) => {
-    const left  = idx === 0 ? x - pad : (xs[idx-1] + x) / 2;
-    const right = idx === xs.length - 1 ? x + pad : (x + xs[idx+1]) / 2;
-    return { left, right, center: x };
+    const padEdge = medianGap * 0.75; // extremos amplios
+    const padMid  = medianGap * 0.65; // interiores más anchos que la mitad
+    const left  = idx === 0 ? x - padEdge : (xs[idx-1] + x) / 2 - padMid*0.15;
+    const right = idx === xs.length - 1 ? x + padEdge : (x + xs[idx+1]) / 2 + padMid*0.15;
+    const width = right - left;
+    return { left, right, center: x, width };
   });
 }
 
-function numsInCell(row, left, right) {
-  const nums = [];
-  const pieces = [];
-  for (const c of row.cells) {
-    if (c.x < left || c.x > right) continue;
-    pieces.push(c.text);
-    const n = parseNumberLoose(c.text); // <-- suelto
-    if (n != null) nums.push(n);
-  }
-  // si viene partido (p.ej. "54" + "300"), intenta concatenar
-  if (!nums.length && pieces.length) {
-    const concat = pieces.join("").replace(/[^\d()-.,]/g, "");
-    const n2 = parseNumberMX(concat);
-    if (n2 != null) return n2;
-  }
-  return nums.length ? nums.reduce((a,b)=>a+b,0) : 0;
-}
-function textInCell(row, left, right) {
-  const parts = [];
-  for (const c of row.cells) if (c.x >= left && c.x <= right) parts.push(c.text);
-  return parts.join(" ").replace(/\s+/g, " ").trim();
-}
-function parseCalifTokens(s) {
-  if (!s) return [];
-  return (s.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
+// dentro de una celda: obtiene tokens por X y por banda Y
+function tokensInCell(allTokens, left, right, yCenter, yTol) {
+  return allTokens.filter(t => t.x >= left && t.x <= right && Math.abs(t.y - yCenter) <= yTol);
 }
 
-// fallback si celda queda 0: número más cercano al centro
-function nearestNumberAtX(row, x, tol = 4.0) {
+// convierte tokens de una celda a número (soporta pegados/partidos)
+function numberFromTokens(cellTokens) {
+  if (!cellTokens.length) return 0;
+  const byX = [...cellTokens].sort((a,b)=>a.x-b.x);
+  const joined = byX.map(t => t.text).join("");
+  const m = joined.match(/[-$()0-9.,]+/g);
+  if (m && m.length) {
+    // si hay varios, usa el de mayor longitud; si empatan, el último
+    const chosen = m.reduce((best, cur) => (cur.length >= best.length ? cur : best), "");
+    const n = parseNumberMX(chosen);
+    if (n != null) return n;
+  }
+  // si no funcionó, intenta sumar tokens numéricos individuales
+  let sum = 0, found = false;
+  for (const t of byX) {
+    const n = parseNumberLoose(t.text);
+    if (n != null) { sum += n; found = true; }
+  }
+  return found ? sum : 0;
+}
+
+// fallback: número más cercano al centro (tolerancia = ancho de columna * factor)
+function nearestNumber(allTokens, centerX, yCenter, yTol, colWidth, factor = 1.1) {
+  const tolX = (colWidth || 6) * factor;
   let best = null, bestDist = Infinity;
-  for (const c of row.cells) {
-    const n = parseNumberLoose(c.text); // <-- suelto
+  for (const t of allTokens) {
+    if (Math.abs(t.y - yCenter) > yTol) continue;
+    const n = parseNumberLoose(t.text);
     if (n == null) continue;
-    const d = Math.abs(c.x - x);
+    const d = Math.abs(t.x - centerX);
     if (d < bestDist) { bestDist = d; best = n; }
   }
-  return bestDist <= tol ? best : 0;
+  return bestDist <= tolX ? best : 0;
 }
 
-// EXTRACTOR Historia (grid + merge y fallback)
 function extractHistoriaByGrid(pdfData) {
-  const pages = pdfData.Pages || [];
-  const out = new Map(); // periodo -> rec
+  const out = new Map(); // periodo -> registro
 
-  for (const pg of pages) {
+  for (const pg of (pdfData.Pages || [])) {
     const rows = pageToRows(pg, 0.35);
+    const toks = tokensOfPage(pg);
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
@@ -406,56 +407,64 @@ function extractHistoriaByGrid(pdfData) {
 
       const bounds = columnBoundaries(months.map(m => m.x));
 
-      // localizar índices de filas de métricas
-      const mIdx = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
-      for (let j = i + 1; j < Math.min(rows.length, i + 16); j++) {
+      // buscar rótulos y sus y-centers
+      const yLabels = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
+      for (let j = i + 1; j < Math.min(rows.length, i + 22); j++) {
         const line = textOfRow(rows[j]);
-        if (MES_RE.test(line)) break; // nuevo bloque
-        if (mIdx.vigente==null && ROW_LABELS.vigente.test(line)) mIdx.vigente = j;
-        else if (mIdx.v1_29==null && ROW_LABELS.v1_29.test(line)) mIdx.v1_29 = j;
-        else if (mIdx.v30_59==null && ROW_LABELS.v30_59.test(line)) mIdx.v30_59 = j;
-        else if (mIdx.v60_89==null && ROW_LABELS.v60_89.test(line)) mIdx.v60_89 = j;
-        else if (mIdx.v90_mas==null && ROW_LABELS.v90_mas.test(line)) mIdx.v90_mas = j;
-        else if (mIdx.calif==null && ROW_LABELS.calif.test(line)) mIdx.calif = j;
+        if (MES_RE.test(line)) break;
+        if (yLabels.vigente==null && ROW_LABELS.vigente.test(line)) yLabels.vigente = rows[j].y;
+        else if (yLabels.v1_29==null && ROW_LABELS.v1_29.test(line)) yLabels.v1_29 = rows[j].y;
+        else if (yLabels.v30_59==null && ROW_LABELS.v30_59.test(line)) yLabels.v30_59 = rows[j].y;
+        else if (yLabels.v60_89==null && ROW_LABELS.v60_89.test(line)) yLabels.v60_89 = rows[j].y;
+        else if (yLabels.v90_mas==null && ROW_LABELS.v90_mas.test(line)) yLabels.v90_mas = rows[j].y;
+        else if (yLabels.calif==null && ROW_LABELS.calif.test(line)) yLabels.calif = rows[j].y;
       }
+      if (!yLabels.vigente) continue;
 
-      // merge filas cercanas
-      const metrics = {};
-      for (const k of Object.keys(mIdx)) {
-        metrics[k] = mIdx[k] != null ? mergeWithNeighbors(rows, mIdx[k], 2, 1.4) : null;
-      }
-      if (!metrics.vigente) continue;
+      // tolerancia vertical (si las filas están muy separadas, usar >=1.6)
+      const ys = Object.values(yLabels).filter(v => v != null).sort((a,b)=>a-b);
+      const avgGap = ys.length > 1 ? (ys[ys.length-1] - ys[0]) / (ys.length-1) : 1.2;
+      const yTol = Math.max(1.2, Math.min(2.2, avgGap * 0.9));
 
       for (let k = 0; k < months.length; k++) {
         const periodo = months[k].periodo;
-        const { left, right, center } = bounds[k];
+        const { left, right, center, width } = bounds[k];
 
-        let vigente   = numsInCell(metrics.vigente, left, right);
-        let v1_29     = metrics.v1_29 ? numsInCell(metrics.v1_29, left, right) : 0;
-        let v30_59    = metrics.v30_59 ? numsInCell(metrics.v30_59, left, right) : 0;
-        let v60_89    = metrics.v60_89 ? numsInCell(metrics.v60_89, left, right) : 0;
-        let v90_mas   = metrics.v90_mas ? numsInCell(metrics.v90_mas, left, right) : 0;
+        // CELDAS por banda Y
+        const cVig   = tokensInCell(toks, left, right, yLabels.vigente,  yTol);
+        const c129   = yLabels.v1_29   != null ? tokensInCell(toks, left, right, yLabels.v1_29,   yTol) : [];
+        const c3059  = yLabels.v30_59  != null ? tokensInCell(toks, left, right, yLabels.v30_59,  yTol) : [];
+        const c6089  = yLabels.v60_89  != null ? tokensInCell(toks, left, right, yLabels.v60_89,  yTol) : [];
+        const c90mas = yLabels.v90_mas != null ? tokensInCell(toks, left, right, yLabels.v90_mas, yTol) : [];
+        const cCal   = yLabels.calif   != null ? tokensInCell(toks, left, right, yLabels.calif,   yTol) : [];
 
-        // fallback por centro si quedó 0
-        if (!vigente) vigente = nearestNumberAtX(metrics.vigente, center, 4.0);
-        if (!v1_29 && metrics.v1_29) v1_29 = nearestNumberAtX(metrics.v1_29, center, 4.0);
-        if (!v30_59 && metrics.v30_59) v30_59 = nearestNumberAtX(metrics.v30_59, center, 4.0);
-        if (!v60_89 && metrics.v60_89) v60_89 = nearestNumberAtX(metrics.v60_89, center, 4.0);
-        if (!v90_mas && metrics.v90_mas) v90_mas = nearestNumberAtX(metrics.v90_mas, center, 4.0);
+        let vigente = numberFromTokens(cVig);
+        let v1_29   = numberFromTokens(c129);
+        let v30_59  = numberFromTokens(c3059);
+        let v60_89  = numberFromTokens(c6089);
+        let v90_mas = numberFromTokens(c90mas);
 
-        const calTxt    = metrics.calif ? textInCell(metrics.calif, left, right) : "";
-        const calTokens = parseCalifTokens(calTxt);
+        // fallback nearest por columna si quedó 0
+        if (!vigente) vigente = nearestNumber(toks, center, yLabels.vigente, yTol, width, 1.1);
+        if (!v1_29 && yLabels.v1_29!=null)   v1_29   = nearestNumber(toks, center, yLabels.v1_29,   yTol, width, 1.1);
+        if (!v30_59 && yLabels.v30_59!=null) v30_59  = nearestNumber(toks, center, yLabels.v30_59,  yTol, width, 1.1);
+        if (!v60_89 && yLabels.v60_89!=null) v60_89  = nearestNumber(toks, center, yLabels.v60_89,  yTol, width, 1.1);
+        if (!v90_mas && yLabels.v90_mas!=null) v90_mas = nearestNumber(toks, center, yLabels.v90_mas, yTol, width, 1.1);
 
-        const venc = (v1_29||0) + (v30_59||0) + (v60_89||0) + (v90_mas||0);
+        // calificación: concatenar textos y extraer tokens tipo "1EX 1A2 4A1"
+        const calTxt = cCal.sort((a,b)=>a.x-b.x).map(t=>t.text).join(" ").replace(/\s+/g," ").trim();
+        const calTokens = (calTxt.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
+
+        const venc = (v1_29||0)+(v30_59||0)+(v60_89||0)+(v90_mas||0);
         out.set(periodo, {
           periodo,
           vigente,
-          venc_1_29: v1_29,
-          venc_30_59: v30_59,
-          venc_60_89: v60_89,
-          venc_90_mas: v90_mas,
+          venc_1_29: v1_29 || 0,
+          venc_30_59: v30_59 || 0,
+          venc_60_89: v60_89 || 0,
+          venc_90_mas: v90_mas || 0,
           calificacion_cartera: calTokens,
-          total_mes: (vigente||0) + venc,
+          total_mes: (vigente || 0) + venc,
           sin_atrasos: venc === 0
         });
       }
