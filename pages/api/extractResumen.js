@@ -35,6 +35,13 @@ function parseNumberMX(str) {
   const n = Number(s);
   return neg ? -n : n;
 }
+// NUEVO: toma el 1er token numérico aunque esté pegado a letras (p. ej. "42942Vigente")
+function parseNumberLoose(str) {
+  if (str == null) return null;
+  const m = String(str).match(/[-$()0-9.,]+/);
+  if (!m) return null;
+  return parseNumberMX(m[0]);
+}
 function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
 function textOfRow(row) { return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim(); }
 
@@ -116,7 +123,7 @@ function assignRowToColumns(row, colCenters, maxDist) {
   if (row.cells.some(c => /(Total(?:es)?)\s*:?/i.test(c.text))) acc.hasTotales = true;
 
   for (const c of row.cells) {
-    const n = parseNumberMX(c.text);
+    const n = parseNumberLoose(c.text); // <-- suelto
     if (n === null) continue;
     acc.numericByX.push({ x: c.x, n });
 
@@ -313,7 +320,7 @@ function toPeriodo(token) {
 }
 
 // Combina la fila base con vecinas (±N) si |Δy| <= maxDy
-function mergeWithNeighbors(rows, baseIdx, span = 2, maxDy = 0.9) {
+function mergeWithNeighbors(rows, baseIdx, span = 2, maxDy = 1.4) {
   const base = rows[baseIdx];
   const merged = { y: base.y, cells: [...base.cells] };
   for (let k = 1; k <= span; k++) {
@@ -330,38 +337,29 @@ function columnBoundaries(xCenters) {
   const xs = [...xCenters].sort((a,b)=>a-b);
   const gaps = []; for (let i = 1; i < xs.length; i++) gaps.push(xs[i]-xs[i-1]);
   const medianGap = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6;
-  const half = medianGap / 2;
   const pad = medianGap * 0.6; // ensanchar extremos
 
-  const bounds = xs.map((x, idx) => {
+  return xs.map((x, idx) => {
     const left  = idx === 0 ? x - pad : (xs[idx-1] + x) / 2;
     const right = idx === xs.length - 1 ? x + pad : (x + xs[idx+1]) / 2;
     return { left, right, center: x };
   });
-  return bounds;
 }
 
 function numsInCell(row, left, right) {
   const nums = [];
+  const pieces = [];
   for (const c of row.cells) {
     if (c.x < left || c.x > right) continue;
-    const n = parseNumberMX(c.text);
+    pieces.push(c.text);
+    const n = parseNumberLoose(c.text); // <-- suelto
     if (n != null) nums.push(n);
   }
-  // si el número viene en tokens partidos (e.g. "54" + "300"), preferimos reconstruir por concatenación
-  if (nums.length > 1) {
-    // Heurística: si todos son enteros y el mayor >= 100, usa suma; si son pequeños tipo [54,300], concatena
-    const allInt = nums.every(v => Number.isInteger(v));
-    const maxv = Math.max(...nums);
-    if (allInt && maxv < 1000) {
-      // concatenar como string respetando orden de aparición
-      const ordered = row.cells
-        .filter(c => c.x >= left && c.x <= right)
-        .map(c => c.text)
-        .join("")
-        .replace(/[^\d]/g, "");
-      if (ordered) return parseInt(ordered, 10);
-    }
+  // si viene partido (p.ej. "54" + "300"), intenta concatenar
+  if (!nums.length && pieces.length) {
+    const concat = pieces.join("").replace(/[^\d()-.,]/g, "");
+    const n2 = parseNumberMX(concat);
+    if (n2 != null) return n2;
   }
   return nums.length ? nums.reduce((a,b)=>a+b,0) : 0;
 }
@@ -376,10 +374,10 @@ function parseCalifTokens(s) {
 }
 
 // fallback si celda queda 0: número más cercano al centro
-function nearestNumberAtX(row, x, tol = 3.0) {
+function nearestNumberAtX(row, x, tol = 4.0) {
   let best = null, bestDist = Infinity;
   for (const c of row.cells) {
-    const n = parseNumberMX(c.text);
+    const n = parseNumberLoose(c.text); // <-- suelto
     if (n == null) continue;
     const d = Math.abs(c.x - x);
     if (d < bestDist) { bestDist = d; best = n; }
@@ -424,7 +422,7 @@ function extractHistoriaByGrid(pdfData) {
       // merge filas cercanas
       const metrics = {};
       for (const k of Object.keys(mIdx)) {
-        metrics[k] = mIdx[k] != null ? mergeWithNeighbors(rows, mIdx[k], 2, 0.9) : null;
+        metrics[k] = mIdx[k] != null ? mergeWithNeighbors(rows, mIdx[k], 2, 1.4) : null;
       }
       if (!metrics.vigente) continue;
 
@@ -432,7 +430,6 @@ function extractHistoriaByGrid(pdfData) {
         const periodo = months[k].periodo;
         const { left, right, center } = bounds[k];
 
-        // leer celdas
         let vigente   = numsInCell(metrics.vigente, left, right);
         let v1_29     = metrics.v1_29 ? numsInCell(metrics.v1_29, left, right) : 0;
         let v30_59    = metrics.v30_59 ? numsInCell(metrics.v30_59, left, right) : 0;
@@ -440,11 +437,11 @@ function extractHistoriaByGrid(pdfData) {
         let v90_mas   = metrics.v90_mas ? numsInCell(metrics.v90_mas, left, right) : 0;
 
         // fallback por centro si quedó 0
-        if (!vigente) vigente = nearestNumberAtX(metrics.vigente, center, 3.2);
-        if (!v1_29 && metrics.v1_29) v1_29 = nearestNumberAtX(metrics.v1_29, center, 3.2);
-        if (!v30_59 && metrics.v30_59) v30_59 = nearestNumberAtX(metrics.v30_59, center, 3.2);
-        if (!v60_89 && metrics.v60_89) v60_89 = nearestNumberAtX(metrics.v60_89, center, 3.2);
-        if (!v90_mas && metrics.v90_mas) v90_mas = nearestNumberAtX(metrics.v90_mas, center, 3.2);
+        if (!vigente) vigente = nearestNumberAtX(metrics.vigente, center, 4.0);
+        if (!v1_29 && metrics.v1_29) v1_29 = nearestNumberAtX(metrics.v1_29, center, 4.0);
+        if (!v30_59 && metrics.v30_59) v30_59 = nearestNumberAtX(metrics.v30_59, center, 4.0);
+        if (!v60_89 && metrics.v60_89) v60_89 = nearestNumberAtX(metrics.v60_89, center, 4.0);
+        if (!v90_mas && metrics.v90_mas) v90_mas = nearestNumberAtX(metrics.v90_mas, center, 4.0);
 
         const calTxt    = metrics.calif ? textInCell(metrics.calif, left, right) : "";
         const calTokens = parseCalifTokens(calTxt);
@@ -582,7 +579,7 @@ export default async function handler(req, res) {
           }
         }
 
-        // ===== Historia (grid robusto) =====
+        // ===== Historia =====
         const histRaw = extractHistoriaByGrid(pdfData);
         const historia = applyMultiplierHistoria(histRaw, multiplier);
         const kpisHistoria = computeKPIsHistoria(historia);
