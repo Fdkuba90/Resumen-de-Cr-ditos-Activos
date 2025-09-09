@@ -293,7 +293,7 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   };
 }
 
-/* ======================== HISTORIA (grid con columnas fijas) ======================== */
+/* ======================== HISTORIA (grid + merge filas + fallback) ======================== */
 const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
 const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
 
@@ -312,21 +312,35 @@ function toPeriodo(token) {
   return mm ? `${anio}-${mm}` : null;
 }
 
-// boundaries por columna (xLeft/xRight)
+// Combina la fila base con vecinas (±N) si |Δy| <= maxDy
+function mergeWithNeighbors(rows, baseIdx, span = 2, maxDy = 0.9) {
+  const base = rows[baseIdx];
+  const merged = { y: base.y, cells: [...base.cells] };
+  for (let k = 1; k <= span; k++) {
+    const prev = rows[baseIdx - k], next = rows[baseIdx + k];
+    if (prev && Math.abs(prev.y - base.y) <= maxDy) merged.cells.push(...prev.cells);
+    if (next && Math.abs(next.y - base.y) <= maxDy) merged.cells.push(...next.cells);
+  }
+  merged.cells.sort((a,b)=>a.x-b.x);
+  return merged;
+}
+
+// límites por columna; extremos más anchos
 function columnBoundaries(xCenters) {
   const xs = [...xCenters].sort((a,b)=>a-b);
   const gaps = []; for (let i = 1; i < xs.length; i++) gaps.push(xs[i]-xs[i-1]);
   const medianGap = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6;
   const half = medianGap / 2;
+  const pad = medianGap * 0.6; // ensanchar extremos
+
   const bounds = xs.map((x, idx) => {
-    const left = idx === 0 ? x - half : (xs[idx-1] + x) / 2;
-    const right = idx === xs.length - 1 ? x + half : (x + xs[idx+1]) / 2;
+    const left  = idx === 0 ? x - pad : (xs[idx-1] + x) / 2;
+    const right = idx === xs.length - 1 ? x + pad : (x + xs[idx+1]) / 2;
     return { left, right, center: x };
   });
   return bounds;
 }
 
-// números dentro de la celda
 function numsInCell(row, left, right) {
   const nums = [];
   for (const c of row.cells) {
@@ -334,10 +348,23 @@ function numsInCell(row, left, right) {
     const n = parseNumberMX(c.text);
     if (n != null) nums.push(n);
   }
-  // en celdas puede haber 2 tokens (miles/decimales), preferimos sumar
+  // si el número viene en tokens partidos (e.g. "54" + "300"), preferimos reconstruir por concatenación
+  if (nums.length > 1) {
+    // Heurística: si todos son enteros y el mayor >= 100, usa suma; si son pequeños tipo [54,300], concatena
+    const allInt = nums.every(v => Number.isInteger(v));
+    const maxv = Math.max(...nums);
+    if (allInt && maxv < 1000) {
+      // concatenar como string respetando orden de aparición
+      const ordered = row.cells
+        .filter(c => c.x >= left && c.x <= right)
+        .map(c => c.text)
+        .join("")
+        .replace(/[^\d]/g, "");
+      if (ordered) return parseInt(ordered, 10);
+    }
+  }
   return nums.length ? nums.reduce((a,b)=>a+b,0) : 0;
 }
-// texto crudo dentro de la celda (para calificación)
 function textInCell(row, left, right) {
   const parts = [];
   for (const c of row.cells) if (c.x >= left && c.x <= right) parts.push(c.text);
@@ -348,7 +375,19 @@ function parseCalifTokens(s) {
   return (s.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
 }
 
-// EXTRACTOR: detecta cada bloque de meses y usa celdas fijas por columna
+// fallback si celda queda 0: número más cercano al centro
+function nearestNumberAtX(row, x, tol = 3.0) {
+  let best = null, bestDist = Infinity;
+  for (const c of row.cells) {
+    const n = parseNumberMX(c.text);
+    if (n == null) continue;
+    const d = Math.abs(c.x - x);
+    if (d < bestDist) { bestDist = d; best = n; }
+  }
+  return bestDist <= tol ? best : 0;
+}
+
+// EXTRACTOR Historia (grid + merge y fallback)
 function extractHistoriaByGrid(pdfData) {
   const pages = pdfData.Pages || [];
   const out = new Map(); // periodo -> rec
@@ -359,9 +398,8 @@ function extractHistoriaByGrid(pdfData) {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const monthCells = r.cells.filter(c => MES_RE.test(c.text));
-      if (monthCells.length < 2) continue; // un bloque típico tiene varias columnas
+      if (monthCells.length < 2) continue;
 
-      // centros X por columna y períodos por orden left->right
       const months = monthCells
         .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
         .filter(m => !!m.periodo)
@@ -370,36 +408,48 @@ function extractHistoriaByGrid(pdfData) {
 
       const bounds = columnBoundaries(months.map(m => m.x));
 
-      // localizar filas de métricas cercanas (hasta 12 filas abajo)
-      const metrics = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
-      for (let j = i + 1; j < Math.min(rows.length, i + 14); j++) {
+      // localizar índices de filas de métricas
+      const mIdx = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
+      for (let j = i + 1; j < Math.min(rows.length, i + 16); j++) {
         const line = textOfRow(rows[j]);
         if (MES_RE.test(line)) break; // nuevo bloque
-        if (!metrics.vigente && ROW_LABELS.vigente.test(line)) metrics.vigente = rows[j];
-        else if (!metrics.v1_29 && ROW_LABELS.v1_29.test(line)) metrics.v1_29 = rows[j];
-        else if (!metrics.v30_59 && ROW_LABELS.v30_59.test(line)) metrics.v30_59 = rows[j];
-        else if (!metrics.v60_89 && ROW_LABELS.v60_89.test(line)) metrics.v60_89 = rows[j];
-        else if (!metrics.v90_mas && ROW_LABELS.v90_mas.test(line)) metrics.v90_mas = rows[j];
-        else if (!metrics.calif && ROW_LABELS.calif.test(line)) metrics.calif = rows[j];
+        if (mIdx.vigente==null && ROW_LABELS.vigente.test(line)) mIdx.vigente = j;
+        else if (mIdx.v1_29==null && ROW_LABELS.v1_29.test(line)) mIdx.v1_29 = j;
+        else if (mIdx.v30_59==null && ROW_LABELS.v30_59.test(line)) mIdx.v30_59 = j;
+        else if (mIdx.v60_89==null && ROW_LABELS.v60_89.test(line)) mIdx.v60_89 = j;
+        else if (mIdx.v90_mas==null && ROW_LABELS.v90_mas.test(line)) mIdx.v90_mas = j;
+        else if (mIdx.calif==null && ROW_LABELS.calif.test(line)) mIdx.calif = j;
       }
 
-      // si no hay al menos vigente, seguimos
+      // merge filas cercanas
+      const metrics = {};
+      for (const k of Object.keys(mIdx)) {
+        metrics[k] = mIdx[k] != null ? mergeWithNeighbors(rows, mIdx[k], 2, 0.9) : null;
+      }
       if (!metrics.vigente) continue;
 
-      // por cada columna, leer la "celda" fija
       for (let k = 0; k < months.length; k++) {
         const periodo = months[k].periodo;
-        const { left, right } = bounds[k];
+        const { left, right, center } = bounds[k];
 
-        const vigente   = numsInCell(metrics.vigente, left, right);
-        const v1_29     = metrics.v1_29 ? numsInCell(metrics.v1_29, left, right) : 0;
-        const v30_59    = metrics.v30_59 ? numsInCell(metrics.v30_59, left, right) : 0;
-        const v60_89    = metrics.v60_89 ? numsInCell(metrics.v60_89, left, right) : 0;
-        const v90_mas   = metrics.v90_mas ? numsInCell(metrics.v90_mas, left, right) : 0;
+        // leer celdas
+        let vigente   = numsInCell(metrics.vigente, left, right);
+        let v1_29     = metrics.v1_29 ? numsInCell(metrics.v1_29, left, right) : 0;
+        let v30_59    = metrics.v30_59 ? numsInCell(metrics.v30_59, left, right) : 0;
+        let v60_89    = metrics.v60_89 ? numsInCell(metrics.v60_89, left, right) : 0;
+        let v90_mas   = metrics.v90_mas ? numsInCell(metrics.v90_mas, left, right) : 0;
+
+        // fallback por centro si quedó 0
+        if (!vigente) vigente = nearestNumberAtX(metrics.vigente, center, 3.2);
+        if (!v1_29 && metrics.v1_29) v1_29 = nearestNumberAtX(metrics.v1_29, center, 3.2);
+        if (!v30_59 && metrics.v30_59) v30_59 = nearestNumberAtX(metrics.v30_59, center, 3.2);
+        if (!v60_89 && metrics.v60_89) v60_89 = nearestNumberAtX(metrics.v60_89, center, 3.2);
+        if (!v90_mas && metrics.v90_mas) v90_mas = nearestNumberAtX(metrics.v90_mas, center, 3.2);
+
         const calTxt    = metrics.calif ? textInCell(metrics.calif, left, right) : "";
         const calTokens = parseCalifTokens(calTxt);
 
-        const venc = v1_29 + v30_59 + v60_89 + v90_mas;
+        const venc = (v1_29||0) + (v30_59||0) + (v60_89||0) + (v90_mas||0);
         out.set(periodo, {
           periodo,
           vigente,
@@ -408,7 +458,7 @@ function extractHistoriaByGrid(pdfData) {
           venc_60_89: v60_89,
           venc_90_mas: v90_mas,
           calificacion_cartera: calTokens,
-          total_mes: vigente + venc,
+          total_mes: (vigente||0) + venc,
           sin_atrasos: venc === 0
         });
       }
@@ -532,7 +582,7 @@ export default async function handler(req, res) {
           }
         }
 
-        // ===== Historia (GRID: columnas fijas por x) =====
+        // ===== Historia (grid robusto) =====
         const histRaw = extractHistoriaByGrid(pdfData);
         const historia = applyMultiplierHistoria(histRaw, multiplier);
         const kpisHistoria = computeKPIsHistoria(historia);
