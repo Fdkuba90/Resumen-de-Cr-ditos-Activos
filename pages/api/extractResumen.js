@@ -5,11 +5,9 @@ import PDFParser from "pdf2json";
 
 export const config = { api: { bodyParser: false } };
 
-/* ============== UTILIDADES BÁSICAS ============== */
+/* ======================== UTILIDADES BÁSICAS ======================== */
 function decodeTxt(t = "") { try { return decodeURIComponent(t); } catch { return t; } }
-function normalizeSpaces(s = "") {
-  return (s || "").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim();
-}
+function normalizeSpaces(s = "") { return (s || "").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim(); }
 function parseNumberMX(str) {
   if (str == null) return null;
   let s = String(str).replace(/\u00A0/g, " ").trim();
@@ -20,15 +18,10 @@ function parseNumberMX(str) {
   const n = Number(s);
   return neg ? -n : n;
 }
-function parseNumberLoose(str) {
-  if (str == null) return null;
-  const m = String(str).match(/[-$()0-9.,]+/);
-  if (!m) return null;
-  return parseNumberMX(m[0]);
-}
+function parseNumberLoose(str) { const m = String(str||"").match(/[-$()0-9.,]+/); return m ? parseNumberMX(m[0]) : null; }
 function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
 
-/* ============== FILAS (para localizar secciones) ============== */
+/* ======================== FILAS (para localizar secciones) ======================== */
 function pageToRows(page, yTol = 0.35) {
   const rows = [];
   for (const t of page.Texts || []) {
@@ -46,7 +39,7 @@ function pageToRows(page, yTol = 0.35) {
 }
 function textOfRow(row) { return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim(); }
 
-/* ============== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ============== */
+/* ======================== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ======================== */
 function findActivosPage(pdfData) {
   const pages = pdfData.Pages || [];
   for (let p = 0; p < pages.length; p++) {
@@ -59,7 +52,7 @@ function findActivosPage(pdfData) {
   return null;
 }
 
-/* ============== TOTALES POR COORDENADAS ============== */
+/* ======================== TOTALES POR COORDENADAS ======================== */
 const HEADER_COLS = [
   { key: "original",   re: /\boriginal\b/i },
   { key: "vigente",    re: /\bvigente\b/i },
@@ -190,7 +183,7 @@ function extractTotalsByCoords(pdfData) {
   return null;
 }
 
-/* ============== TOTALES (“BRIDOVA”) ============== */
+/* ======================== TOTALES “BRIDOVA” (texto) ======================== */
 function extractTotalsBridova(allText) {
   const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const idxs = [];
@@ -226,7 +219,7 @@ function extractTotalsBridova(allText) {
   return null;
 }
 
-/* ============== FALLBACKS TEXTO ============== */
+/* ======================== FALLBACKS (texto) ======================== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -273,7 +266,7 @@ function extractBuckets(lines) {
   return out;
 }
 
-/* ============== RESPUESTA (Totales) ============== */
+/* ======================== RESPUESTA TOTALES ======================== */
 function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
@@ -301,7 +294,7 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   };
 }
 
-/* ============== HISTORIA (1: nearest, 3: autocalibración, 5: cruce Total mes) ============== */
+/* ======================== HISTORIA (1: nearest 1↔1, 3: autocal, 5: cruce Total) ======================== */
 const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
 const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
 const ROW_LABELS = {
@@ -314,11 +307,7 @@ const ROW_LABELS = {
   calif: /Calificaci[oó]n de Cartera/i,
 };
 
-function toPeriodo(token) {
-  const [mes, anio] = token.trim().split(/\s+/);
-  const mm = MONTHS[mes];
-  return mm ? `${anio}-${mm}` : null;
-}
+function toPeriodo(token) { const [mes, anio] = token.trim().split(/\s+/); const mm = MONTHS[mes]; return mm ? `${anio}-${mm}` : null; }
 function tokensOfPage(pg) {
   const out = [];
   for (const t of (pg.Texts || [])) {
@@ -341,111 +330,93 @@ function centersFromMonths(row) {
   return { months, centers, avgGap: gap };
 }
 
-// agrupa tokens por proximidad X y devuelve “tokens numéricos consolidados”
-function numericGroupsInBand(allTokens, yCenter, yTol, groupDx = 1.0) {
-  const band = allTokens.filter(t => Math.abs(t.y - yCenter) <= yTol);
-  band.sort((a,b)=>a.x-b.x);
+// agrupa tokens horizontales y devuelve “números consolidados” con su X promedio
+function numericGroupsInBand(allTokens, yCenter, yTol = 1.6, groupDx = 1.0) {
+  const band = allTokens.filter(t => Math.abs(t.y - yCenter) <= yTol).sort((a,b)=>a.x-b.x);
   const groups = [];
   for (const t of band) {
     const last = groups[groups.length-1];
-    if (!last || (t.x - last._lastX) > groupDx) {
-      groups.push({ _lastX: t.x, tokens: [t] });
-    } else {
-      last.tokens.push(t);
-      last._lastX = t.x;
-    }
+    if (!last || (t.x - last._lastX) > groupDx) groups.push({ _lastX: t.x, tokens:[t] });
+    else { last.tokens.push(t); last._lastX = t.x; }
   }
   const out = [];
   for (const g of groups) {
-    const text = g.tokens.map(t=>t.text).join("");
-    const mAll = text.match(/[-$()0-9.,]+/g);
-    if (!mAll || !mAll.length) continue;
-    // quedarnos con el “número más largo” del grupo
-    const chosen = mAll.reduce((best,cur)=> (cur.length >= best.length ? cur : best), "");
+    const joined = g.tokens.map(t=>t.text).join("");
+    const parts = joined.match(/[-$()0-9.,]+/g);
+    if (!parts || !parts.length) continue;
+    const chosen = parts.reduce((best,cur)=> (cur.length >= best.length ? cur : best), "");
     const n = parseNumberMX(chosen);
     if (n == null) continue;
     const x = g.tokens.reduce((a,t)=>a+t.x,0)/g.tokens.length;
-    out.push({ x, y: yCenter, n });
+    out.push({ x, n });
   }
   return out;
 }
 
-// 1) Asignación por centro más cercano + dedupe natural
-function nearestAssign(consolTokens, centers, maxFrac = 0.75, avgGap = 6) {
+// 1) Asignación por centro más cercano PERO 1↔1 (cada token a lo sumo una columna)
+function assignNearestUnique(consolTokens, centers, maxFrac = 0.85, avgGap = 6) {
   const maxDx = (avgGap || 6) * maxFrac;
-  const assigned = new Array(centers.length).fill(0).map(()=>[]);
-  for (const t of consolTokens) {
-    let bestIdx = -1, bestDist = Infinity;
-    for (let j=0;j<centers.length;j++) {
-      const d = Math.abs(t.x - centers[j]);
-      if (d < bestDist) { bestDist = d; bestIdx = j; }
-    }
-    if (bestIdx >= 0 && bestDist <= maxDx) {
-      assigned[bestIdx].push({ ...t, dist: bestDist });
-    }
-  }
-  // elegir por columna el token con mayor “longitud efectiva”: |n| y/o menor distancia
-  const values = centers.map((_,j) => {
-    const arr = assigned[j];
-    if (!arr.length) return { value: 0, used: null, delta: 0 };
-    const chosen = arr.reduce((best,cur) => {
-      if (!best) return cur;
-      // prioridad: menor distancia, luego magnitud
-      if (cur.dist < best.dist - 0.01) return cur;
-      if (Math.abs(cur.n) > Math.abs(best.n)) return cur;
-      return best;
-    }, null);
-    return { value: chosen.n, used: chosen, delta: (chosen.x - centers[j]) };
+  // construir pares (token, centro) con distancia y ordenar por distancia asc
+  const pairs = [];
+  consolTokens.forEach((t, ti) => {
+    centers.forEach((cx, ci) => {
+      const d = Math.abs(t.x - cx);
+      if (d <= maxDx) pairs.push({ ti, ci, d });
+    });
   });
+  pairs.sort((a,b)=> a.d - b.d);
+
+  const usedToken = new Set(), usedCol = new Set();
+  const assign = new Array(centers.length).fill(null);
+  for (const p of pairs) {
+    if (usedToken.has(p.ti) || usedCol.has(p.ci)) continue;
+    usedToken.add(p.ti); usedCol.add(p.ci);
+    assign[p.ci] = consolTokens[p.ti];
+  }
+  const values = centers.map((_,ci) => assign[ci] ? { value: assign[ci].n, used: assign[ci], delta: (assign[ci].x - centers[ci]) } : { value: 0, used: null, delta: 0 });
   return values;
 }
 
-// 3) Auto-calibración: corrige sesgo sistemático usando “Vigente”
+// 3) Auto-calibración: usa la mediana del sesgo de Vigente
 function autoCalibrate(centers, valoresVigente, avgGap) {
-  const deltas = valoresVigente
-    .map(v => (v && v.used ? v.delta : null))
-    .filter(v => v != null);
-  if (deltas.length < 3) return centers; // pocas muestras
+  const deltas = valoresVigente.map(v => (v && v.used ? v.delta : null)).filter(v => v != null);
+  if (deltas.length < 3) return centers;
   const sorted = [...deltas].sort((a,b)=>a-b);
   const median = sorted[Math.floor(sorted.length/2)];
-  const limit = (avgGap || 6) * 0.35; // no mover demasiado
-  if (Math.abs(median) < (avgGap * 0.15)) return centers; // sesgo pequeño
+  const limit = (avgGap || 6) * 0.35;
+  if (Math.abs(median) < (avgGap * 0.12)) return centers;
   const shift = Math.max(-limit, Math.min(limit, median));
   return centers.map(x => x + shift);
 }
 
-// 5) Cruce con “Total mes”: busca el shift que minimiza el error contra el PDF
+// 5) Cruce con “Total mes”: busca el micro-shift que minimiza el error
 function refineShiftWithTotals(centers, avgGap, toks, yCenters, yTol) {
-  if (yCenters.totalMes == null) return centers; // no hay total mes
-  const tryCenters = [];
-  const step = (avgGap || 6) * 0.08;
-  const limit = (avgGap || 6) * 0.32;
-  for (let s = -limit; s <= limit + 1e-6; s += step) tryCenters.push(centers.map(x=>x+s));
-
-  const totalsPDF = nearestAssign(
-    numericGroupsInBand(toks, yCenters.totalMes, yTol), centers, 0.85, avgGap
+  if (yCenters.totalMes == null) return centers;
+  const totalsPDF = assignNearestUnique(
+    numericGroupsInBand(toks, yCenters.totalMes, yTol), centers, 0.9, avgGap
   ).map(v => v.value);
 
+  const step = (avgGap || 6) * 0.06;
+  const limit = (avgGap || 6) * 0.28;
   let best = centers, bestErr = Infinity;
-  for (const C of tryCenters) {
-    const vVig = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.85, avgGap).map(v=>v.value);
-    const v129 = yCenters.v1_29!=null ? nearestAssign(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.85, avgGap).map(v=>v.value) : C.map(()=>0);
-    const v3059= yCenters.v30_59!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v30_59, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
-    const v6089= yCenters.v60_89!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v60_89, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
-    const v90m = yCenters.v90_mas!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v90_mas, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
 
-    const totalsCalc = C.map((_,i)=>(vVig[i]||0)+(v129[i]||0)+(v3059[i]||0)+(v6089[i]||0)+(v90m[i]||0));
-    // error robusto: mediana del |dif|
+  for (let s = -limit; s <= limit + 1e-6; s += step) {
+    const C = centers.map(x=>x+s);
+    const vV = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.9, avgGap).map(v=>v.value);
+    const vA = yCenters.v1_29!=null ? assignNearestUnique(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.9, avgGap).map(v=>v.value) : C.map(()=>0);
+    const vB = yCenters.v30_59!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v30_59, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
+    const vC = yCenters.v60_89!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v60_89, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
+    const vD = yCenters.v90_mas!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v90_mas, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
+    const totalsCalc = C.map((_,i)=>(vV[i]||0)+(vA[i]||0)+(vB[i]||0)+(vC[i]||0)+(vD[i]||0));
     const diffs = totalsPDF.map((pdf,i)=> Math.abs((pdf||0) - (totalsCalc[i]||0)));
-    const sorted = diffs.filter(x=>x!=null).sort((a,b)=>a-b);
-    const medErr = sorted[Math.floor(sorted.length/2)] || 0;
+    const medErr = diffs.slice().sort((a,b)=>a-b)[Math.floor(diffs.length/2)] || 0;
     if (medErr < bestErr) { bestErr = medErr; best = C; }
   }
   return best;
 }
 
 function extractHistoria(pdfData) {
-  const out = new Map(); // periodo -> registro
+  const out = new Map();
 
   for (const pg of (pdfData.Pages || [])) {
     const rows = pageToRows(pg, 0.35);
@@ -455,12 +426,18 @@ function extractHistoria(pdfData) {
       const r = rows[i];
       if (r.cells.filter(c=>MES_RE.test(c.text)).length < 2) continue;
 
-      // centros iniciales por meses
-      const { months, centers, avgGap } = centersFromMonths(r);
+      const months = r.cells
+        .filter(c => MES_RE.test(c.text))
+        .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
+        .filter(m => !!m.periodo)
+        .sort((a,b)=>a.x-b.x);
       if (!months.length) continue;
-      const yCenters = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, totalMes:null, calif:null };
 
-      // buscar rótulos hacia abajo
+      const centers = months.map(m => m.x);
+      const avgGap = centers.length>1 ? centers.slice(1).reduce((a,x,idx)=>a+(x-centers[idx]),0)/(centers.length-1) : 6;
+
+      // localizar y de rótulos
+      const yCenters = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, totalMes:null, calif:null };
       for (let j = i + 1; j < Math.min(rows.length, i + 24); j++) {
         const line = textOfRow(rows[j]);
         if (MES_RE.test(line)) break;
@@ -474,51 +451,45 @@ function extractHistoria(pdfData) {
       }
       if (!yCenters.vigente) continue;
 
-      // yTol dinámico
-      const ys = Object.values(yCenters).filter(v=>v!=null).sort((a,b)=>a-b);
-      const avgRowGap = ys.length>1 ? (ys[ys.length-1]-ys[0])/(ys.length-1) : 1.4;
-      const yTol = Math.max(1.2, Math.min(2.2, avgRowGap*0.9));
+      // tolerancia vertical amplia y fija (funciona mejor en reportes Buró)
+      const yTol = 1.8;
 
-      // 1) nearest con centros crudos
-      const vigInicial = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), centers, 0.85, avgGap);
+      // 1) nearest 1↔1 con centros crudos
+      const vig0 = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), centers, 0.9, avgGap);
 
-      // 3) auto-calibración (shift global por sesgo de Vigente)
-      const centersCal = autoCalibrate(centers, vigInicial, avgGap);
+      // 3) autocalibración por sesgo de “Vigente”
+      const centersCal = autoCalibrate(centers, vig0, avgGap);
 
-      // 5) cruce con Total mes (si existe)
-      const centersFinal = refineShiftWithTotals(centersCal, avgGap, toks, yCenters, yTol);
+      // 5) cruce con “Total mes”
+      const C = refineShiftWithTotals(centersCal, avgGap, toks, yCenters, yTol);
 
-      // asignación final para todas las bandas
-      const vigVals = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), centersFinal, 0.85, avgGap).map(v=>v.value);
-      const b129    = yCenters.v1_29!=null ? nearestAssign(numericGroupsInBand(toks, yCenters.v1_29, yTol), centersFinal, 0.85, avgGap).map(v=>v.value) : centersFinal.map(()=>0);
-      const b3059   = yCenters.v30_59!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v30_59, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
-      const b6089   = yCenters.v60_89!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v60_89, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
-      const b90m    = yCenters.v90_mas!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v90_mas, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
+      // asignación final (todas las bandas)
+      const vV = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.9, avgGap).map(v=>v.value);
+      const vA = yCenters.v1_29!=null ? assignNearestUnique(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.9, avgGap).map(v=>v.value) : C.map(()=>0);
+      const vB = yCenters.v30_59!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v30_59, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
+      const vC = yCenters.v60_89!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v60_89, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
+      const vD = yCenters.v90_mas!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v90_mas, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
 
-      // calificación (texto)
-      const calRowTokens = (yCenters.calif!=null)
-        ? toks.filter(t => Math.abs(t.y - yCenters.calif) <= yTol)
-        : [];
-      const calByCol = centersFinal.map(cx => {
-        const near = calRowTokens
+      // calificación (texto, por proximidad al centro)
+      const calRow = (yCenters.calif!=null) ? toks.filter(t => Math.abs(t.y - yCenters.calif) <= yTol) : [];
+      const calByCol = C.map(cx => {
+        const near = calRow
           .map(t => ({ t, d: Math.abs(t.x - cx) }))
           .filter(o => o.d <= (avgGap*0.9))
           .sort((a,b)=>a.d-b.d)
           .slice(0,6)
           .map(o=>o.t.text)
           .join(" ");
-        const tokens = (near.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
-        return tokens;
+        return (near.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
       });
 
-      // armar salida por mes
       for (let k = 0; k < months.length; k++) {
         const periodo = months[k].periodo;
-        const vigente = vigVals[k] || 0;
-        const v1_29   = b129[k]  || 0;
-        const v30_59  = b3059[k] || 0;
-        const v60_89  = b6089[k] || 0;
-        const v90_mas = b90m[k]  || 0;
+        const vigente = vV[k] || 0;
+        const v1_29   = vA[k] || 0;
+        const v30_59  = vB[k] || 0;
+        const v60_89  = vC[k] || 0;
+        const v90_mas = vD[k] || 0;
         const venc = v1_29 + v30_59 + v60_89 + v90_mas;
         out.set(periodo, {
           periodo,
@@ -527,8 +498,8 @@ function extractHistoria(pdfData) {
           venc_30_59: v30_59,
           venc_60_89: v60_89,
           venc_90_mas: v90_mas,
-          calificacion_cartera: calByCol[k] || [],
           total_mes: vigente + venc,
+          calificacion_cartera: calByCol[k] || [],
           sin_atrasos: venc === 0
         });
       }
@@ -588,7 +559,7 @@ function computeKPIsHistoria(rows) {
   return { mesesConAtraso, peorBucket, mesPeorBucket, ratiosVencidoSobreVigente, sumasPorBucket, mesesDesdeUltimo90mas };
 }
 
-/* ============== HANDLER ============== */
+/* ======================== HANDLER ======================== */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método no permitido" });
 
