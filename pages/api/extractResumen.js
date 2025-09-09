@@ -5,7 +5,7 @@ import PDFParser from "pdf2json";
 
 export const config = { api: { bodyParser: false } };
 
-/* ======================== UTILIDADES BÁSICAS ======================== */
+/* ======================== Utilidades ======================== */
 function decodeTxt(t = "") { try { return decodeURIComponent(t); } catch { return t; } }
 function normalizeSpaces(s = "") { return (s || "").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim(); }
 function parseNumberMX(str) {
@@ -21,7 +21,7 @@ function parseNumberMX(str) {
 function parseNumberLoose(str) { const m = String(str||"").match(/[-$()0-9.,]+/); return m ? parseNumberMX(m[0]) : null; }
 function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
 
-/* ======================== FILAS (para localizar secciones) ======================== */
+/* ======================== Rows & tokens ======================== */
 function pageToRows(page, yTol = 0.35) {
   const rows = [];
   for (const t of page.Texts || []) {
@@ -37,9 +37,28 @@ function pageToRows(page, yTol = 0.35) {
   for (const r of rows) r.cells.sort((a,b) => a.x - b.x);
   return rows;
 }
+function tokensOfPage(pg) {
+  const out = [];
+  for (const t of (pg.Texts || [])) {
+    const text = (t.R || []).map(r => decodeTxt(r.T)).join("");
+    if (!text.trim()) continue;
+    out.push({ x: t.x, y: t.y, text });
+  }
+  return out;
+}
 function textOfRow(row) { return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim(); }
 
-/* ======================== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ======================== */
+/* ======================== TOTALES (igual que antes) ======================== */
+const HEADER_COLS = [
+  { key: "original",   re: /\boriginal\b/i },
+  { key: "vigente",    re: /\bvigente\b/i },
+  { key: "v1_29",      re: /(1\s*[–-]\s*29|1\s*a\s*29)\s*d[ií]as?/i },
+  { key: "v30_59",     re: /(30\s*[–-]\s*59|30\s*a\s*59)\s*d[ií]as?/i },
+  { key: "v60_89",     re: /(60\s*[–-]\s*89|60\s*a\s*89)\s*d[ií]as?/i },
+  { key: "v90_119",    re: /(90\s*[–-]\s*119|90\s*a\s*119)\s*d[ií]as?/i },
+  { key: "v120_179",   re: /(120\s*[–-]\s*179|120\s*a\s*179)\s*d[ií]as?/i },
+  { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
+];
 function findActivosPage(pdfData) {
   const pages = pdfData.Pages || [];
   for (let p = 0; p < pages.length; p++) {
@@ -51,33 +70,17 @@ function findActivosPage(pdfData) {
   }
   return null;
 }
-
-/* ======================== TOTALES POR COORDENADAS ======================== */
-const HEADER_COLS = [
-  { key: "original",   re: /\boriginal\b/i },
-  { key: "vigente",    re: /\bvigente\b/i },
-  { key: "v1_29",      re: /(1\s*[–-]\s*29|1\s*a\s*29)\s*d[ií]as?/i },
-  { key: "v30_59",     re: /(30\s*[–-]\s*59|30\s*a\s*59)\s*d[ií]as?/i },
-  { key: "v60_89",     re: /(60\s*[–-]\s*89|60\s*a\s*89)\s*d[ií]as?/i },
-  { key: "v90_119",    re: /(90\s*[–-]\s*119|90\s*a\s*119)\s*d[ií]as?/i },
-  { key: "v120_179",   re: /(120\s*[–-]\s*179|120\s*a\s*179)\s*d[ií]as?/i },
-  { key: "v180p",      re: /(180\+|180\s*\+|180\s*y\s*m[aá]s|180\s*o\s+m[aá]s)/i },
-];
-
 function findHeaderConfig(rows) {
   for (let i = 0; i < rows.length; i++) {
     const r0 = rows[i];
     const l0 = textOfRow(r0);
     if (!/original/i.test(l0) || !/vigente/i.test(l0)) continue;
-
     const merged = { y: r0.y, cells: [...r0.cells] };
     if (rows[i+1] && rows[i+1].y - r0.y < 1.8) merged.cells.push(...rows[i+1].cells);
     if (rows[i+2] && rows[i+2].y - r0.y < 2.6) merged.cells.push(...rows[i+2].cells);
     merged.cells.sort((a,b)=>a.x-b.x);
-
     const hasDias = merged.cells.some(c => /d[ií]as/i.test(c.text));
     if (!hasDias) continue;
-
     const colCenters = {};
     for (const col of HEADER_COLS) {
       for (const c of merged.cells) {
@@ -86,27 +89,14 @@ function findHeaderConfig(rows) {
       }
     }
     if (colCenters.original == null || colCenters.vigente == null) continue;
-
-    const known = Object.entries(colCenters).sort((a,b)=>a[1]-b[1]);
-    const xs = known.map(([,x])=>x);
-    const gaps = []; for (let k=1;k<xs.length;k++) gaps.push(xs[k]-xs[k-1]);
-    const median = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 4.5;
-
-    const want = ["v1_29","v30_59","v60_89","v90_119","v120_179","v180p"];
-    for (const key of want) if (colCenters[key] == null) colCenters[key] = (colCenters.vigente ?? xs[0]) + median * (want.indexOf(key)+1);
-
     const xsAll = Object.values(colCenters).sort((a,b)=>a-b);
-    const medGap = (() => {
-      const g=[]; for(let k=1;k<xsAll.length;k++) g.push(xsAll[k]-xsAll[k-1]);
-      return g.sort((a,b)=>a-b)[Math.floor(g.length/2)] || 5;
-    })();
+    const g=[]; for(let k=1;k<xsAll.length;k++) g.push(xsAll[k]-xsAll[k-1]);
+    const medGap = g.sort((a,b)=>a-b)[Math.floor(g.length/2)] || 5;
     const maxDist = Math.max(2.0, medGap * 0.6);
-
     return { headerRowY: r0.y, colCenters, maxDist };
   }
   return null;
 }
-
 function assignRowToColumns(row, colCenters, maxDist) {
   const acc = {
     original: [], vigente: [],
@@ -114,12 +104,10 @@ function assignRowToColumns(row, colCenters, maxDist) {
     hasTotales: false, numericByX: []
   };
   if (row.cells.some(c => /(Total(?:es)?)\s*:?/i.test(c.text))) acc.hasTotales = true;
-
   for (const c of row.cells) {
     const n = parseNumberLoose(c.text);
     if (n === null) continue;
     acc.numericByX.push({ x: c.x, n });
-
     let bestKey = null, bestDist = Infinity;
     for (const [key, x] of Object.entries(colCenters)) {
       const d = Math.abs(c.x - x);
@@ -128,10 +116,8 @@ function assignRowToColumns(row, colCenters, maxDist) {
     if (!bestKey || bestDist > maxDist) continue;
     acc[bestKey].push(n);
   }
-
   const sum = arr => (arr || []).reduce((a,b)=>a+(Number(b)||0), 0);
   const maxVal = arr => (arr || []).reduce((m,v)=> (m==null || Math.abs(v)>Math.abs(m)) ? v : m, null);
-
   let original = maxVal(acc.original);
   let vigente  = maxVal(acc.vigente);
   const buckets = {
@@ -142,7 +128,6 @@ function assignRowToColumns(row, colCenters, maxDist) {
     v120_179:sum(acc.v120_179),
     v180p:   sum(acc.v180p),
   };
-
   const ordered = acc.numericByX.sort((a,b)=>a.x-b.x).map(o=>o.n);
   if (ordered.length >= 2) {
     if (original == null || original === 0) original = ordered[0];
@@ -155,23 +140,18 @@ function assignRowToColumns(row, colCenters, maxDist) {
   buckets.v90_119 = fillIfZero(buckets.v90_119, 5);
   buckets.v120_179= fillIfZero(buckets.v120_179,6);
   buckets.v180p   = fillIfZero(buckets.v180p,   7);
-
   return { original, vigente, buckets, hasTotales: acc.hasTotales };
 }
-
 function extractTotalsByCoords(pdfData) {
   const hit = findActivosPage(pdfData);
   if (!hit) return null;
   const { pageIndex } = hit;
   const rows = pageToRows(pdfData.Pages[pageIndex], 0.35);
-
   const header = findHeaderConfig(rows);
   if (!header) return null;
-
   const { headerRowY, colCenters, maxDist } = header;
   const startIdx = rows.findIndex(r => Math.abs(r.y - headerRowY) < 1e-6);
   const candidates = rows.slice(startIdx + 1);
-
   for (const row of candidates) {
     const line = textOfRow(row);
     if (/Resumen Cr[ée]ditos Activos|Cr[ée]ditos Liquidados|INFORMACI[ÓO]N COMERCIAL/i.test(line)) break;
@@ -182,14 +162,11 @@ function extractTotalsByCoords(pdfData) {
   }
   return null;
 }
-
-/* ======================== TOTALES “BRIDOVA” (texto) ======================== */
 function extractTotalsBridova(allText) {
   const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const idxs = [];
   for (let i = 0; i < lines.length; i++) if (/(Total(?:es)?)\s*:?/i.test(lines[i])) idxs.push(i);
   if (!idxs.length) return null;
-
   const tryParseLine = (line) => {
     const raw = (line.match(/[-$()0-9.,]+/g) || []).map(t => t.replace(/[^\d()-]/g, ""));
     const cleaned = raw
@@ -204,7 +181,6 @@ function extractTotalsBridova(allText) {
     return { original, vigente,
       buckets: { v1_29:b1||0, v30_59:b2||0, v60_89:b3||0, v90_119:b4||0, v120_179:b5||0, v180p:b6||0 } };
   };
-
   for (const i of idxs) {
     const candidates = [
       lines[i], lines[i-1] || "", lines[i+1] || "",
@@ -218,8 +194,6 @@ function extractTotalsBridova(allText) {
   }
   return null;
 }
-
-/* ======================== FALLBACKS (texto) ======================== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -265,8 +239,6 @@ function extractBuckets(lines) {
   }
   return out;
 }
-
-/* ======================== RESPUESTA TOTALES ======================== */
 function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
@@ -275,7 +247,6 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
     (buckets.v90_119 || 0) +
     (buckets.v120_179 || 0) +
     (buckets.v180p || 0);
-
   return {
     montoOriginal: original != null ? original * multiplier : null,
     saldoVigente: vigente != null ? vigente * multiplier : null,
@@ -294,217 +265,136 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   };
 }
 
-/* ======================== HISTORIA (1: nearest 1↔1, 3: autocal, 5: cruce Total) ======================== */
-const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
-const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
-const ROW_LABELS = {
-  vigente: /\bVigente\b/i,
-  v1_29: /Vencido.*(1\s*a\s*29|1\s*[–-]\s*29)\s*d[ií]as?/i,
-  v30_59: /Vencido.*(30\s*a\s*59|30\s*[–-]\s*59)\s*d[ií]as?/i,
-  v60_89: /Vencido.*(60\s*a\s*89|60\s*[–-]\s*89)\s*d[ií]as?/i,
-  v90_mas: /(Vencido.*(m[aá]s\s*de\s*89|90\+|89\+))|Vencido.*(90\s*y\s*m[aá]s)/i,
-  totalMes: /\bTotal\s*mes\b/i,
-  calif: /Calificaci[oó]n de Cartera/i,
-};
+/* ======================== HISTORIA: filas por periodo (coordenadas fijas) ======================== */
+const PERIOD_RE = /\b(20\d{2})\s*[–-]\s*(0[1-9]|1[0-2])\b/; // 2025-03 / 2025–03
+const HCOLS = [
+  { key: "periodo", re: /\bPeriodo\b/i },
+  { key: "vigente", re: /\bVigente\b/i },
+  { key: "b129",    re: /1\s*[–-]\s*29\b/ },
+  { key: "b3059",   re: /30\s*[–-]\s*59\b/ },
+  { key: "b6089",   re: /60\s*[–-]\s*89\b/ },
+  { key: "b90m",    re: /90\+\b/ },
+  { key: "total",   re: /\bTotal\s*mes\b/i },
+  { key: "calif",   re: /Calificaci[oó]n de Cartera/i },
+];
 
-function toPeriodo(token) { const [mes, anio] = token.trim().split(/\s+/); const mm = MONTHS[mes]; return mm ? `${anio}-${mm}` : null; }
-function tokensOfPage(pg) {
-  const out = [];
-  for (const t of (pg.Texts || [])) {
-    const text = (t.R || []).map(r => decodeTxt(r.T)).join("");
-    if (!text.trim()) continue;
-    out.push({ x: t.x, y: t.y, text });
-  }
-  return out;
-}
-function centersFromMonths(row) {
-  const months = row.cells
-    .filter(c => MES_RE.test(c.text))
-    .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
-    .filter(m => !!m.periodo)
-    .sort((a,b)=>a.x-b.x);
-  const centers = months.map(m => m.x);
-  const gap = centers.length > 1
-    ? centers.slice(1).reduce((a,x,i)=>a+(x-centers[i]),0)/(centers.length-1)
-    : 6;
-  return { months, centers, avgGap: gap };
-}
-
-// agrupa tokens horizontales y devuelve “números consolidados” con su X promedio
-function numericGroupsInBand(allTokens, yCenter, yTol = 1.6, groupDx = 1.0) {
-  const band = allTokens.filter(t => Math.abs(t.y - yCenter) <= yTol).sort((a,b)=>a.x-b.x);
-  const groups = [];
-  for (const t of band) {
-    const last = groups[groups.length-1];
-    if (!last || (t.x - last._lastX) > groupDx) groups.push({ _lastX: t.x, tokens:[t] });
-    else { last.tokens.push(t); last._lastX = t.x; }
-  }
-  const out = [];
-  for (const g of groups) {
-    const joined = g.tokens.map(t=>t.text).join("");
-    const parts = joined.match(/[-$()0-9.,]+/g);
-    if (!parts || !parts.length) continue;
-    const chosen = parts.reduce((best,cur)=> (cur.length >= best.length ? cur : best), "");
-    const n = parseNumberMX(chosen);
-    if (n == null) continue;
-    const x = g.tokens.reduce((a,t)=>a+t.x,0)/g.tokens.length;
-    out.push({ x, n });
-  }
-  return out;
-}
-
-// 1) Asignación por centro más cercano PERO 1↔1 (cada token a lo sumo una columna)
-function assignNearestUnique(consolTokens, centers, maxFrac = 0.85, avgGap = 6) {
-  const maxDx = (avgGap || 6) * maxFrac;
-  // construir pares (token, centro) con distancia y ordenar por distancia asc
-  const pairs = [];
-  consolTokens.forEach((t, ti) => {
-    centers.forEach((cx, ci) => {
-      const d = Math.abs(t.x - cx);
-      if (d <= maxDx) pairs.push({ ti, ci, d });
-    });
-  });
-  pairs.sort((a,b)=> a.d - b.d);
-
-  const usedToken = new Set(), usedCol = new Set();
-  const assign = new Array(centers.length).fill(null);
-  for (const p of pairs) {
-    if (usedToken.has(p.ti) || usedCol.has(p.ci)) continue;
-    usedToken.add(p.ti); usedCol.add(p.ci);
-    assign[p.ci] = consolTokens[p.ti];
-  }
-  const values = centers.map((_,ci) => assign[ci] ? { value: assign[ci].n, used: assign[ci], delta: (assign[ci].x - centers[ci]) } : { value: 0, used: null, delta: 0 });
-  return values;
-}
-
-// 3) Auto-calibración: usa la mediana del sesgo de Vigente
-function autoCalibrate(centers, valoresVigente, avgGap) {
-  const deltas = valoresVigente.map(v => (v && v.used ? v.delta : null)).filter(v => v != null);
-  if (deltas.length < 3) return centers;
-  const sorted = [...deltas].sort((a,b)=>a-b);
-  const median = sorted[Math.floor(sorted.length/2)];
-  const limit = (avgGap || 6) * 0.35;
-  if (Math.abs(median) < (avgGap * 0.12)) return centers;
-  const shift = Math.max(-limit, Math.min(limit, median));
-  return centers.map(x => x + shift);
-}
-
-// 5) Cruce con “Total mes”: busca el micro-shift que minimiza el error
-function refineShiftWithTotals(centers, avgGap, toks, yCenters, yTol) {
-  if (yCenters.totalMes == null) return centers;
-  const totalsPDF = assignNearestUnique(
-    numericGroupsInBand(toks, yCenters.totalMes, yTol), centers, 0.9, avgGap
-  ).map(v => v.value);
-
-  const step = (avgGap || 6) * 0.06;
-  const limit = (avgGap || 6) * 0.28;
-  let best = centers, bestErr = Infinity;
-
-  for (let s = -limit; s <= limit + 1e-6; s += step) {
-    const C = centers.map(x=>x+s);
-    const vV = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.9, avgGap).map(v=>v.value);
-    const vA = yCenters.v1_29!=null ? assignNearestUnique(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.9, avgGap).map(v=>v.value) : C.map(()=>0);
-    const vB = yCenters.v30_59!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v30_59, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-    const vC = yCenters.v60_89!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v60_89, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-    const vD = yCenters.v90_mas!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v90_mas, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-    const totalsCalc = C.map((_,i)=>(vV[i]||0)+(vA[i]||0)+(vB[i]||0)+(vC[i]||0)+(vD[i]||0));
-    const diffs = totalsPDF.map((pdf,i)=> Math.abs((pdf||0) - (totalsCalc[i]||0)));
-    const medErr = diffs.slice().sort((a,b)=>a-b)[Math.floor(diffs.length/2)] || 0;
-    if (medErr < bestErr) { bestErr = medErr; best = C; }
-  }
-  return best;
-}
-
-function extractHistoria(pdfData) {
-  const out = new Map();
-
-  for (const pg of (pdfData.Pages || [])) {
+function findHistoriaHeader(pdfData) {
+  for (let p = 0; p < (pdfData.Pages || []).length; p++) {
+    const pg = pdfData.Pages[p];
     const rows = pageToRows(pg, 0.35);
-    const toks = tokensOfPage(pg);
-
     for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      if (r.cells.filter(c=>MES_RE.test(c.text)).length < 2) continue;
+      const line = textOfRow(rows[i]);
+      if (!/Periodo/i.test(line) || !/Calificaci[oó]n de Cartera/i.test(line)) continue;
 
-      const months = r.cells
-        .filter(c => MES_RE.test(c.text))
-        .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
-        .filter(m => !!m.periodo)
-        .sort((a,b)=>a.x-b.x);
-      if (!months.length) continue;
+      // Mezcla header+subheader si estuvieran en dos líneas (guiones, etc.)
+      const merged = { y: rows[i].y, cells: [...rows[i].cells] };
+      if (rows[i+1] && rows[i+1].y - rows[i].y < 1.5) merged.cells.push(...rows[i+1].cells);
 
-      const centers = months.map(m => m.x);
-      const avgGap = centers.length>1 ? centers.slice(1).reduce((a,x,idx)=>a+(x-centers[idx]),0)/(centers.length-1) : 6;
-
-      // localizar y de rótulos
-      const yCenters = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, totalMes:null, calif:null };
-      for (let j = i + 1; j < Math.min(rows.length, i + 24); j++) {
-        const line = textOfRow(rows[j]);
-        if (MES_RE.test(line)) break;
-        if (yCenters.vigente==null   && ROW_LABELS.vigente.test(line))  yCenters.vigente = rows[j].y;
-        else if (yCenters.v1_29==null   && ROW_LABELS.v1_29.test(line)) yCenters.v1_29 = rows[j].y;
-        else if (yCenters.v30_59==null  && ROW_LABELS.v30_59.test(line))yCenters.v30_59 = rows[j].y;
-        else if (yCenters.v60_89==null  && ROW_LABELS.v60_89.test(line))yCenters.v60_89 = rows[j].y;
-        else if (yCenters.v90_mas==null && ROW_LABELS.v90_mas.test(line))yCenters.v90_mas = rows[j].y;
-        else if (yCenters.totalMes==null&& ROW_LABELS.totalMes.test(line))yCenters.totalMes = rows[j].y;
-        else if (yCenters.calif==null   && ROW_LABELS.calif.test(line))  yCenters.calif = rows[j].y;
+      const colX = {};
+      for (const def of HCOLS) {
+        const hit = merged.cells.find(c => def.re.test(c.text));
+        if (hit) colX[def.key] = hit.x;
       }
-      if (!yCenters.vigente) continue;
+      // necesitamos al menos periodo, vigente y calif para confiar
+      if (colX.periodo == null || colX.vigente == null || colX.calif == null) continue;
 
-      // tolerancia vertical amplia y fija (funciona mejor en reportes Buró)
-      const yTol = 1.8;
+      // ordenados por X para límites
+      const order = Object.entries(colX).sort((a,b)=>a[1]-b[1]);
+      const xs = order.map(([,x])=>x);
+      const gaps = []; for (let j=1;j<xs.length;j++) gaps.push(xs[j]-xs[j-1]);
+      const medGap = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6;
 
-      // 1) nearest 1↔1 con centros crudos
-      const vig0 = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), centers, 0.9, avgGap);
-
-      // 3) autocalibración por sesgo de “Vigente”
-      const centersCal = autoCalibrate(centers, vig0, avgGap);
-
-      // 5) cruce con “Total mes”
-      const C = refineShiftWithTotals(centersCal, avgGap, toks, yCenters, yTol);
-
-      // asignación final (todas las bandas)
-      const vV = assignNearestUnique(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.9, avgGap).map(v=>v.value);
-      const vA = yCenters.v1_29!=null ? assignNearestUnique(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.9, avgGap).map(v=>v.value) : C.map(()=>0);
-      const vB = yCenters.v30_59!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v30_59, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-      const vC = yCenters.v60_89!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v60_89, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-      const vD = yCenters.v90_mas!=null? assignNearestUnique(numericGroupsInBand(toks, yCenters.v90_mas, yTol),C,0.9,avgGap).map(v=>v.value): C.map(()=>0);
-
-      // calificación (texto, por proximidad al centro)
-      const calRow = (yCenters.calif!=null) ? toks.filter(t => Math.abs(t.y - yCenters.calif) <= yTol) : [];
-      const calByCol = C.map(cx => {
-        const near = calRow
-          .map(t => ({ t, d: Math.abs(t.x - cx) }))
-          .filter(o => o.d <= (avgGap*0.9))
-          .sort((a,b)=>a.d-b.d)
-          .slice(0,6)
-          .map(o=>o.t.text)
-          .join(" ");
-        return (near.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
-      });
-
-      for (let k = 0; k < months.length; k++) {
-        const periodo = months[k].periodo;
-        const vigente = vV[k] || 0;
-        const v1_29   = vA[k] || 0;
-        const v30_59  = vB[k] || 0;
-        const v60_89  = vC[k] || 0;
-        const v90_mas = vD[k] || 0;
-        const venc = v1_29 + v30_59 + v60_89 + v90_mas;
-        out.set(periodo, {
-          periodo,
-          vigente,
-          venc_1_29: v1_29,
-          venc_30_59: v30_59,
-          venc_60_89: v60_89,
-          venc_90_mas: v90_mas,
-          total_mes: vigente + venc,
-          calificacion_cartera: calByCol[k] || [],
-          sin_atrasos: venc === 0
-        });
+      // construir ventanas [left,right] por columna
+      const bounds = {};
+      const keysByX = order.map(([k])=>k);
+      for (let j=0;j<keysByX.length;j++) {
+        const key = keysByX[j];
+        const x = colX[key];
+        const left = j===0 ? x - medGap*0.6 : (x + colX[keysByX[j-1]])/2;
+        const right = j===keysByX.length-1 ? x + medGap*0.9 : (x + colX[keysByX[j+1]])/2;
+        bounds[key] = { left, right, x };
       }
+
+      return { pageIndex: p, headerIndex: i, rows, pg, bounds };
     }
   }
+  return null;
+}
+
+function tokensInBand(tokens, yCenter, yTol) {
+  return tokens.filter(t => Math.abs(t.y - yCenter) <= yTol).sort((a,b)=>a.x-b.x);
+}
+function numberFromWindow(tokensRow, left, right) {
+  const inWin = tokensRow.filter(t => t.x >= left && t.x <= right);
+  if (!inWin.length) return 0;
+  const joined = inWin.map(t=>t.text).join("");
+  const m = joined.match(/[-$()0-9.,]+/g);
+  if (m && m.length) {
+    const chosen = m.reduce((best,cur)=> (cur.length >= best.length ? cur : best), "");
+    const n = parseNumberMX(chosen);
+    if (n != null) return n;
+  }
+  // si no, sumar piezas numéricas
+  let sum = 0, found=false;
+  for (const t of inWin) {
+    const n = parseNumberLoose(t.text);
+    if (n!=null) { sum += n; found = true; }
+  }
+  return found ? sum : 0;
+}
+function textFromWindow(tokensRow, left, right) {
+  return tokensRow.filter(t => t.x >= left && t.x <= right).map(t=>t.text).join(" ").replace(/\s+/g," ").trim();
+}
+
+function extractHistoriaByRowGrid(pdfData) {
+  const hit = findHistoriaHeader(pdfData);
+  if (!hit) return [];
+  const { pageIndex, headerIndex, rows, pg, bounds } = hit;
+
+  const tokens = tokensOfPage(pg);
+  const out = new Map();
+
+  // tolerancia vertical (las filas están bastante alineadas en Buró)
+  const yTol = 0.9;
+
+  for (let i = headerIndex + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const line = textOfRow(r);
+    // cortar si empieza otra sección
+    if (/Cr[ée]ditos Liquidados|INFORMACI[ÓO]N COMERCIAL|Resumen/i.test(line)) break;
+
+    // detectar periodo (en toda la fila o, preferentemente, en la ventana Periodo)
+    let periodo = null;
+    const fromWin = textFromWindow(tokensInBand(tokens, r.y, yTol), bounds.periodo.left, bounds.periodo.right);
+    const m1 = fromWin.match(PERIOD_RE) || line.match(PERIOD_RE);
+    if (m1) periodo = `${m1[1]}-${m1[2]}`;
+    if (!periodo) continue; // no es una fila de datos
+
+    const bandToks = tokensInBand(tokens, r.y, yTol);
+
+    const vigente = numberFromWindow(bandToks, bounds.vigente.left, bounds.vigente.right);
+    const b129    = bounds.b129    ? numberFromWindow(bandToks, bounds.b129.left, bounds.b129.right) : 0;
+    const b3059   = bounds.b3059   ? numberFromWindow(bandToks, bounds.b3059.left, bounds.b3059.right) : 0;
+    const b6089   = bounds.b6089   ? numberFromWindow(bandToks, bounds.b6089.left, bounds.b6089.right) : 0;
+    const b90m    = bounds.b90m    ? numberFromWindow(bandToks, bounds.b90m.left, bounds.b90m.right) : 0;
+    const total   = bounds.total   ? numberFromWindow(bandToks, bounds.total.left, bounds.total.right) : (vigente + b129 + b3059 + b6089 + b90m);
+
+    const calTxt  = bounds.calif ? textFromWindow(bandToks, bounds.calif.left, bounds.calif.right) : "";
+    const calTokens = (calTxt.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
+
+    out.set(periodo, {
+      periodo,
+      vigente,
+      venc_1_29: b129,
+      venc_30_59: b3059,
+      venc_60_89: b6089,
+      venc_90_mas: b90m,
+      total_mes: total,
+      calificacion_cartera: calTokens,
+      sin_atrasos: (b129 + b3059 + b6089 + b90m) === 0
+    });
+  }
+
   return Array.from(out.values()).sort((a,b)=>a.periodo.localeCompare(b.periodo));
 }
 
@@ -519,7 +409,6 @@ function applyMultiplierHistoria(rows, multiplier) {
     total_mes: (r.total_mes || 0) * multiplier
   }));
 }
-
 function computeKPIsHistoria(rows) {
   if (!rows?.length) {
     return {
@@ -559,7 +448,7 @@ function computeKPIsHistoria(rows) {
   return { mesesConAtraso, peorBucket, mesPeorBucket, ratiosVencidoSobreVigente, sumasPorBucket, mesesDesdeUltimo90mas };
 }
 
-/* ======================== HANDLER ======================== */
+/* ======================== Handler ======================== */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método no permitido" });
 
@@ -590,7 +479,7 @@ export default async function handler(req, res) {
         );
         const multiplier = detectMilesDePesos(allText) ? 1000 : 1;
 
-        // ===== Totales =====
+        // ===== TOTALES =====
         let payload = null;
         const totalsCoords = extractTotalsByCoords(pdfData);
         if (totalsCoords) {
@@ -622,8 +511,8 @@ export default async function handler(req, res) {
           }
         }
 
-        // ===== Historia =====
-        const histRaw = extractHistoria(pdfData);
+        // ===== HISTORIA (filas por periodo) =====
+        const histRaw = extractHistoriaByRowGrid(pdfData);
         const historia = applyMultiplierHistoria(histRaw, multiplier);
         const kpisHistoria = computeKPIsHistoria(historia);
 
