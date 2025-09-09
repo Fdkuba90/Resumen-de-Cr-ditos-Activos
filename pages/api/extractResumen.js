@@ -5,7 +5,7 @@ import PDFParser from "pdf2json";
 
 export const config = { api: { bodyParser: false } };
 
-/* ======================== UTILIDADES BÁSICAS ======================== */
+/* ============== UTILIDADES BÁSICAS ============== */
 function decodeTxt(t = "") { try { return decodeURIComponent(t); } catch { return t; } }
 function normalizeSpaces(s = "") {
   return (s || "").replace(/\u00A0/g, " ").replace(/[ \t]+/g, " ").replace(/\r/g, "").trim();
@@ -28,7 +28,7 @@ function parseNumberLoose(str) {
 }
 function detectMilesDePesos(text) { return /(todas las cantidades?.*?en.*?miles de pesos)/i.test(text); }
 
-/* ======================== FILAS (para localizar secciones) ======================== */
+/* ============== FILAS (para localizar secciones) ============== */
 function pageToRows(page, yTol = 0.35) {
   const rows = [];
   for (const t of page.Texts || []) {
@@ -46,7 +46,7 @@ function pageToRows(page, yTol = 0.35) {
 }
 function textOfRow(row) { return row.cells.map(c => c.text).join(" ").replace(/[ \t]+/g, " ").trim(); }
 
-/* ======================== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ======================== */
+/* ============== UBICACIÓN "CRÉDITOS ACTIVOS" (Totales) ============== */
 function findActivosPage(pdfData) {
   const pages = pdfData.Pages || [];
   for (let p = 0; p < pages.length; p++) {
@@ -59,7 +59,7 @@ function findActivosPage(pdfData) {
   return null;
 }
 
-/* ======================== TOTALES POR COORDENADAS ======================== */
+/* ============== TOTALES POR COORDENADAS ============== */
 const HEADER_COLS = [
   { key: "original",   re: /\boriginal\b/i },
   { key: "vigente",    re: /\bvigente\b/i },
@@ -190,7 +190,7 @@ function extractTotalsByCoords(pdfData) {
   return null;
 }
 
-/* ======================== “MODO BRIDOVA” (Totales por texto) ======================== */
+/* ============== TOTALES (“BRIDOVA”) ============== */
 function extractTotalsBridova(allText) {
   const lines = allText.split(/\n+/).map(s => s.trim()).filter(Boolean);
   const idxs = [];
@@ -226,7 +226,7 @@ function extractTotalsBridova(allText) {
   return null;
 }
 
-/* ======================== FALLBACKS (texto clásico) ======================== */
+/* ============== FALLBACKS TEXTO ============== */
 function extractSingleLabeled(lines, labelRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -273,7 +273,7 @@ function extractBuckets(lines) {
   return out;
 }
 
-/* ======================== RESPUESTA (Totales) ======================== */
+/* ============== RESPUESTA (Totales) ============== */
 function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   const vencido =
     (buckets.v1_29 || 0) +
@@ -301,16 +301,16 @@ function buildResult({ original, vigente, buckets, multiplier, fuente }) {
   };
 }
 
-/* ======================== HISTORIA (por bandas Y + columnas X) ======================== */
+/* ============== HISTORIA (1: nearest, 3: autocalibración, 5: cruce Total mes) ============== */
 const MONTHS = { Ene:"01", Feb:"02", Mar:"03", Abr:"04", May:"05", Jun:"06", Jul:"07", Ago:"08", Sep:"09", Oct:"10", Nov:"11", Dic:"12" };
 const MES_RE = /\b(?:Ene|Feb|Mar|Abr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dic)\s+\d{4}\b/;
-
 const ROW_LABELS = {
   vigente: /\bVigente\b/i,
   v1_29: /Vencido.*(1\s*a\s*29|1\s*[–-]\s*29)\s*d[ií]as?/i,
   v30_59: /Vencido.*(30\s*a\s*59|30\s*[–-]\s*59)\s*d[ií]as?/i,
   v60_89: /Vencido.*(60\s*a\s*89|60\s*[–-]\s*89)\s*d[ií]as?/i,
   v90_mas: /(Vencido.*(m[aá]s\s*de\s*89|90\+|89\+))|Vencido.*(90\s*y\s*m[aá]s)/i,
+  totalMes: /\bTotal\s*mes\b/i,
   calif: /Calificaci[oó]n de Cartera/i,
 };
 
@@ -319,8 +319,6 @@ function toPeriodo(token) {
   const mm = MONTHS[mes];
   return mm ? `${anio}-${mm}` : null;
 }
-
-// tokens crudos de una página
 function tokensOfPage(pg) {
   const out = [];
   for (const t of (pg.Texts || [])) {
@@ -330,64 +328,123 @@ function tokensOfPage(pg) {
   }
   return out;
 }
-
-// bordes por columna (centros -> límites). Extremos más anchos.
-function columnBoundaries(xCenters) {
-  const xs = [...xCenters].sort((a,b)=>a-b);
-  const gaps = []; for (let i = 1; i < xs.length; i++) gaps.push(xs[i]-xs[i-1]);
-  const medianGap = gaps.sort((a,b)=>a-b)[Math.floor(gaps.length/2)] || 6;
-
-  return xs.map((x, idx) => {
-    const padEdge = medianGap * 0.75; // extremos amplios
-    const padMid  = medianGap * 0.65; // interiores más anchos que la mitad
-    const left  = idx === 0 ? x - padEdge : (xs[idx-1] + x) / 2 - padMid*0.15;
-    const right = idx === xs.length - 1 ? x + padEdge : (x + xs[idx+1]) / 2 + padMid*0.15;
-    const width = right - left;
-    return { left, right, center: x, width };
-  });
+function centersFromMonths(row) {
+  const months = row.cells
+    .filter(c => MES_RE.test(c.text))
+    .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
+    .filter(m => !!m.periodo)
+    .sort((a,b)=>a.x-b.x);
+  const centers = months.map(m => m.x);
+  const gap = centers.length > 1
+    ? centers.slice(1).reduce((a,x,i)=>a+(x-centers[i]),0)/(centers.length-1)
+    : 6;
+  return { months, centers, avgGap: gap };
 }
 
-// dentro de una celda: obtiene tokens por X y por banda Y
-function tokensInCell(allTokens, left, right, yCenter, yTol) {
-  return allTokens.filter(t => t.x >= left && t.x <= right && Math.abs(t.y - yCenter) <= yTol);
-}
-
-// convierte tokens de una celda a número (soporta pegados/partidos)
-function numberFromTokens(cellTokens) {
-  if (!cellTokens.length) return 0;
-  const byX = [...cellTokens].sort((a,b)=>a.x-b.x);
-  const joined = byX.map(t => t.text).join("");
-  const m = joined.match(/[-$()0-9.,]+/g);
-  if (m && m.length) {
-    // si hay varios, usa el de mayor longitud; si empatan, el último
-    const chosen = m.reduce((best, cur) => (cur.length >= best.length ? cur : best), "");
+// agrupa tokens por proximidad X y devuelve “tokens numéricos consolidados”
+function numericGroupsInBand(allTokens, yCenter, yTol, groupDx = 1.0) {
+  const band = allTokens.filter(t => Math.abs(t.y - yCenter) <= yTol);
+  band.sort((a,b)=>a.x-b.x);
+  const groups = [];
+  for (const t of band) {
+    const last = groups[groups.length-1];
+    if (!last || (t.x - last._lastX) > groupDx) {
+      groups.push({ _lastX: t.x, tokens: [t] });
+    } else {
+      last.tokens.push(t);
+      last._lastX = t.x;
+    }
+  }
+  const out = [];
+  for (const g of groups) {
+    const text = g.tokens.map(t=>t.text).join("");
+    const mAll = text.match(/[-$()0-9.,]+/g);
+    if (!mAll || !mAll.length) continue;
+    // quedarnos con el “número más largo” del grupo
+    const chosen = mAll.reduce((best,cur)=> (cur.length >= best.length ? cur : best), "");
     const n = parseNumberMX(chosen);
-    if (n != null) return n;
-  }
-  // si no funcionó, intenta sumar tokens numéricos individuales
-  let sum = 0, found = false;
-  for (const t of byX) {
-    const n = parseNumberLoose(t.text);
-    if (n != null) { sum += n; found = true; }
-  }
-  return found ? sum : 0;
-}
-
-// fallback: número más cercano al centro (tolerancia = ancho de columna * factor)
-function nearestNumber(allTokens, centerX, yCenter, yTol, colWidth, factor = 1.1) {
-  const tolX = (colWidth || 6) * factor;
-  let best = null, bestDist = Infinity;
-  for (const t of allTokens) {
-    if (Math.abs(t.y - yCenter) > yTol) continue;
-    const n = parseNumberLoose(t.text);
     if (n == null) continue;
-    const d = Math.abs(t.x - centerX);
-    if (d < bestDist) { bestDist = d; best = n; }
+    const x = g.tokens.reduce((a,t)=>a+t.x,0)/g.tokens.length;
+    out.push({ x, y: yCenter, n });
   }
-  return bestDist <= tolX ? best : 0;
+  return out;
 }
 
-function extractHistoriaByGrid(pdfData) {
+// 1) Asignación por centro más cercano + dedupe natural
+function nearestAssign(consolTokens, centers, maxFrac = 0.75, avgGap = 6) {
+  const maxDx = (avgGap || 6) * maxFrac;
+  const assigned = new Array(centers.length).fill(0).map(()=>[]);
+  for (const t of consolTokens) {
+    let bestIdx = -1, bestDist = Infinity;
+    for (let j=0;j<centers.length;j++) {
+      const d = Math.abs(t.x - centers[j]);
+      if (d < bestDist) { bestDist = d; bestIdx = j; }
+    }
+    if (bestIdx >= 0 && bestDist <= maxDx) {
+      assigned[bestIdx].push({ ...t, dist: bestDist });
+    }
+  }
+  // elegir por columna el token con mayor “longitud efectiva”: |n| y/o menor distancia
+  const values = centers.map((_,j) => {
+    const arr = assigned[j];
+    if (!arr.length) return { value: 0, used: null, delta: 0 };
+    const chosen = arr.reduce((best,cur) => {
+      if (!best) return cur;
+      // prioridad: menor distancia, luego magnitud
+      if (cur.dist < best.dist - 0.01) return cur;
+      if (Math.abs(cur.n) > Math.abs(best.n)) return cur;
+      return best;
+    }, null);
+    return { value: chosen.n, used: chosen, delta: (chosen.x - centers[j]) };
+  });
+  return values;
+}
+
+// 3) Auto-calibración: corrige sesgo sistemático usando “Vigente”
+function autoCalibrate(centers, valoresVigente, avgGap) {
+  const deltas = valoresVigente
+    .map(v => (v && v.used ? v.delta : null))
+    .filter(v => v != null);
+  if (deltas.length < 3) return centers; // pocas muestras
+  const sorted = [...deltas].sort((a,b)=>a-b);
+  const median = sorted[Math.floor(sorted.length/2)];
+  const limit = (avgGap || 6) * 0.35; // no mover demasiado
+  if (Math.abs(median) < (avgGap * 0.15)) return centers; // sesgo pequeño
+  const shift = Math.max(-limit, Math.min(limit, median));
+  return centers.map(x => x + shift);
+}
+
+// 5) Cruce con “Total mes”: busca el shift que minimiza el error contra el PDF
+function refineShiftWithTotals(centers, avgGap, toks, yCenters, yTol) {
+  if (yCenters.totalMes == null) return centers; // no hay total mes
+  const tryCenters = [];
+  const step = (avgGap || 6) * 0.08;
+  const limit = (avgGap || 6) * 0.32;
+  for (let s = -limit; s <= limit + 1e-6; s += step) tryCenters.push(centers.map(x=>x+s));
+
+  const totalsPDF = nearestAssign(
+    numericGroupsInBand(toks, yCenters.totalMes, yTol), centers, 0.85, avgGap
+  ).map(v => v.value);
+
+  let best = centers, bestErr = Infinity;
+  for (const C of tryCenters) {
+    const vVig = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), C, 0.85, avgGap).map(v=>v.value);
+    const v129 = yCenters.v1_29!=null ? nearestAssign(numericGroupsInBand(toks, yCenters.v1_29, yTol), C, 0.85, avgGap).map(v=>v.value) : C.map(()=>0);
+    const v3059= yCenters.v30_59!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v30_59, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
+    const v6089= yCenters.v60_89!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v60_89, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
+    const v90m = yCenters.v90_mas!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v90_mas, yTol), C, 0.85, avgGap).map(v=>v.value): C.map(()=>0);
+
+    const totalsCalc = C.map((_,i)=>(vVig[i]||0)+(v129[i]||0)+(v3059[i]||0)+(v6089[i]||0)+(v90m[i]||0));
+    // error robusto: mediana del |dif|
+    const diffs = totalsPDF.map((pdf,i)=> Math.abs((pdf||0) - (totalsCalc[i]||0)));
+    const sorted = diffs.filter(x=>x!=null).sort((a,b)=>a-b);
+    const medErr = sorted[Math.floor(sorted.length/2)] || 0;
+    if (medErr < bestErr) { bestErr = medErr; best = C; }
+  }
+  return best;
+}
+
+function extractHistoria(pdfData) {
   const out = new Map(); // periodo -> registro
 
   for (const pg of (pdfData.Pages || [])) {
@@ -396,81 +453,87 @@ function extractHistoriaByGrid(pdfData) {
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
-      const monthCells = r.cells.filter(c => MES_RE.test(c.text));
-      if (monthCells.length < 2) continue;
+      if (r.cells.filter(c=>MES_RE.test(c.text)).length < 2) continue;
 
-      const months = monthCells
-        .map(c => ({ x: c.x, periodo: toPeriodo(c.text.trim()) }))
-        .filter(m => !!m.periodo)
-        .sort((a,b)=>a.x-b.x);
+      // centros iniciales por meses
+      const { months, centers, avgGap } = centersFromMonths(r);
       if (!months.length) continue;
+      const yCenters = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, totalMes:null, calif:null };
 
-      const bounds = columnBoundaries(months.map(m => m.x));
-
-      // buscar rótulos y sus y-centers
-      const yLabels = { vigente:null, v1_29:null, v30_59:null, v60_89:null, v90_mas:null, calif:null };
-      for (let j = i + 1; j < Math.min(rows.length, i + 22); j++) {
+      // buscar rótulos hacia abajo
+      for (let j = i + 1; j < Math.min(rows.length, i + 24); j++) {
         const line = textOfRow(rows[j]);
         if (MES_RE.test(line)) break;
-        if (yLabels.vigente==null && ROW_LABELS.vigente.test(line)) yLabels.vigente = rows[j].y;
-        else if (yLabels.v1_29==null && ROW_LABELS.v1_29.test(line)) yLabels.v1_29 = rows[j].y;
-        else if (yLabels.v30_59==null && ROW_LABELS.v30_59.test(line)) yLabels.v30_59 = rows[j].y;
-        else if (yLabels.v60_89==null && ROW_LABELS.v60_89.test(line)) yLabels.v60_89 = rows[j].y;
-        else if (yLabels.v90_mas==null && ROW_LABELS.v90_mas.test(line)) yLabels.v90_mas = rows[j].y;
-        else if (yLabels.calif==null && ROW_LABELS.calif.test(line)) yLabels.calif = rows[j].y;
+        if (yCenters.vigente==null   && ROW_LABELS.vigente.test(line))  yCenters.vigente = rows[j].y;
+        else if (yCenters.v1_29==null   && ROW_LABELS.v1_29.test(line)) yCenters.v1_29 = rows[j].y;
+        else if (yCenters.v30_59==null  && ROW_LABELS.v30_59.test(line))yCenters.v30_59 = rows[j].y;
+        else if (yCenters.v60_89==null  && ROW_LABELS.v60_89.test(line))yCenters.v60_89 = rows[j].y;
+        else if (yCenters.v90_mas==null && ROW_LABELS.v90_mas.test(line))yCenters.v90_mas = rows[j].y;
+        else if (yCenters.totalMes==null&& ROW_LABELS.totalMes.test(line))yCenters.totalMes = rows[j].y;
+        else if (yCenters.calif==null   && ROW_LABELS.calif.test(line))  yCenters.calif = rows[j].y;
       }
-      if (!yLabels.vigente) continue;
+      if (!yCenters.vigente) continue;
 
-      // tolerancia vertical (si las filas están muy separadas, usar >=1.6)
-      const ys = Object.values(yLabels).filter(v => v != null).sort((a,b)=>a-b);
-      const avgGap = ys.length > 1 ? (ys[ys.length-1] - ys[0]) / (ys.length-1) : 1.2;
-      const yTol = Math.max(1.2, Math.min(2.2, avgGap * 0.9));
+      // yTol dinámico
+      const ys = Object.values(yCenters).filter(v=>v!=null).sort((a,b)=>a-b);
+      const avgRowGap = ys.length>1 ? (ys[ys.length-1]-ys[0])/(ys.length-1) : 1.4;
+      const yTol = Math.max(1.2, Math.min(2.2, avgRowGap*0.9));
 
+      // 1) nearest con centros crudos
+      const vigInicial = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), centers, 0.85, avgGap);
+
+      // 3) auto-calibración (shift global por sesgo de Vigente)
+      const centersCal = autoCalibrate(centers, vigInicial, avgGap);
+
+      // 5) cruce con Total mes (si existe)
+      const centersFinal = refineShiftWithTotals(centersCal, avgGap, toks, yCenters, yTol);
+
+      // asignación final para todas las bandas
+      const vigVals = nearestAssign(numericGroupsInBand(toks, yCenters.vigente, yTol), centersFinal, 0.85, avgGap).map(v=>v.value);
+      const b129    = yCenters.v1_29!=null ? nearestAssign(numericGroupsInBand(toks, yCenters.v1_29, yTol), centersFinal, 0.85, avgGap).map(v=>v.value) : centersFinal.map(()=>0);
+      const b3059   = yCenters.v30_59!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v30_59, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
+      const b6089   = yCenters.v60_89!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v60_89, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
+      const b90m    = yCenters.v90_mas!=null? nearestAssign(numericGroupsInBand(toks, yCenters.v90_mas, yTol), centersFinal, 0.85, avgGap).map(v=>v.value): centersFinal.map(()=>0);
+
+      // calificación (texto)
+      const calRowTokens = (yCenters.calif!=null)
+        ? toks.filter(t => Math.abs(t.y - yCenters.calif) <= yTol)
+        : [];
+      const calByCol = centersFinal.map(cx => {
+        const near = calRowTokens
+          .map(t => ({ t, d: Math.abs(t.x - cx) }))
+          .filter(o => o.d <= (avgGap*0.9))
+          .sort((a,b)=>a.d-b.d)
+          .slice(0,6)
+          .map(o=>o.t.text)
+          .join(" ");
+        const tokens = (near.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
+        return tokens;
+      });
+
+      // armar salida por mes
       for (let k = 0; k < months.length; k++) {
         const periodo = months[k].periodo;
-        const { left, right, center, width } = bounds[k];
-
-        // CELDAS por banda Y
-        const cVig   = tokensInCell(toks, left, right, yLabels.vigente,  yTol);
-        const c129   = yLabels.v1_29   != null ? tokensInCell(toks, left, right, yLabels.v1_29,   yTol) : [];
-        const c3059  = yLabels.v30_59  != null ? tokensInCell(toks, left, right, yLabels.v30_59,  yTol) : [];
-        const c6089  = yLabels.v60_89  != null ? tokensInCell(toks, left, right, yLabels.v60_89,  yTol) : [];
-        const c90mas = yLabels.v90_mas != null ? tokensInCell(toks, left, right, yLabels.v90_mas, yTol) : [];
-        const cCal   = yLabels.calif   != null ? tokensInCell(toks, left, right, yLabels.calif,   yTol) : [];
-
-        let vigente = numberFromTokens(cVig);
-        let v1_29   = numberFromTokens(c129);
-        let v30_59  = numberFromTokens(c3059);
-        let v60_89  = numberFromTokens(c6089);
-        let v90_mas = numberFromTokens(c90mas);
-
-        // fallback nearest por columna si quedó 0
-        if (!vigente) vigente = nearestNumber(toks, center, yLabels.vigente, yTol, width, 1.1);
-        if (!v1_29 && yLabels.v1_29!=null)   v1_29   = nearestNumber(toks, center, yLabels.v1_29,   yTol, width, 1.1);
-        if (!v30_59 && yLabels.v30_59!=null) v30_59  = nearestNumber(toks, center, yLabels.v30_59,  yTol, width, 1.1);
-        if (!v60_89 && yLabels.v60_89!=null) v60_89  = nearestNumber(toks, center, yLabels.v60_89,  yTol, width, 1.1);
-        if (!v90_mas && yLabels.v90_mas!=null) v90_mas = nearestNumber(toks, center, yLabels.v90_mas, yTol, width, 1.1);
-
-        // calificación: concatenar textos y extraer tokens tipo "1EX 1A2 4A1"
-        const calTxt = cCal.sort((a,b)=>a.x-b.x).map(t=>t.text).join(" ").replace(/\s+/g," ").trim();
-        const calTokens = (calTxt.match(/\b\d+[A-Z]{1,3}\d?\b/g) || []);
-
-        const venc = (v1_29||0)+(v30_59||0)+(v60_89||0)+(v90_mas||0);
+        const vigente = vigVals[k] || 0;
+        const v1_29   = b129[k]  || 0;
+        const v30_59  = b3059[k] || 0;
+        const v60_89  = b6089[k] || 0;
+        const v90_mas = b90m[k]  || 0;
+        const venc = v1_29 + v30_59 + v60_89 + v90_mas;
         out.set(periodo, {
           periodo,
           vigente,
-          venc_1_29: v1_29 || 0,
-          venc_30_59: v30_59 || 0,
-          venc_60_89: v60_89 || 0,
-          venc_90_mas: v90_mas || 0,
-          calificacion_cartera: calTokens,
-          total_mes: (vigente || 0) + venc,
+          venc_1_29: v1_29,
+          venc_30_59: v30_59,
+          venc_60_89: v60_89,
+          venc_90_mas: v90_mas,
+          calificacion_cartera: calByCol[k] || [],
+          total_mes: vigente + venc,
           sin_atrasos: venc === 0
         });
       }
     }
   }
-
   return Array.from(out.values()).sort((a,b)=>a.periodo.localeCompare(b.periodo));
 }
 
@@ -525,7 +588,7 @@ function computeKPIsHistoria(rows) {
   return { mesesConAtraso, peorBucket, mesPeorBucket, ratiosVencidoSobreVigente, sumasPorBucket, mesesDesdeUltimo90mas };
 }
 
-/* ======================== HANDLER ======================== */
+/* ============== HANDLER ============== */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Método no permitido" });
 
@@ -589,7 +652,7 @@ export default async function handler(req, res) {
         }
 
         // ===== Historia =====
-        const histRaw = extractHistoriaByGrid(pdfData);
+        const histRaw = extractHistoria(pdfData);
         const historia = applyMultiplierHistoria(histRaw, multiplier);
         const kpisHistoria = computeKPIsHistoria(historia);
 
